@@ -31,11 +31,12 @@ const EMPTY_LIVE: Live = {
   isRunning: false,
   streamingSince: null,
   lastTps: null,
+  liveTps: null,
   turnOutput: 0,
   turnGenMs: 0,
   lastResponseAt: null,
 }
-const live = atom({ plugin: 'session-cost', key: 'live' } as const, EMPTY_LIVE, { shape: 'live-1' })
+const live = atom({ plugin: 'session-cost', key: 'live' } as const, EMPTY_LIVE, { shape: 'live-2' })
 const contextFill = atom({ plugin: 'session-cost', key: 'context' } as const, null as ContextFill | null)
 const chartMode = atom({ plugin: 'session-cost', key: 'chartMode' } as const, 'source' as ChartMode)
 const selectedTurn = atom({ plugin: 'session-cost', key: 'selectedTurn' } as const, null as number | null)
@@ -535,12 +536,30 @@ export const register: Register = on => {
     const isMain = e.agentId === undefined
     const begun = isMain ? await $.clock.now() : 0
     let first: number | null = null
+    // The live rate, while the response streams: the characters that arrived (text,
+    // visible thinking, tool arguments) at about four to a token, over the real time
+    // since the first piece, written at most once a second.
+    let chars = 0
+    let wallStart = 0
+    let lastWrite = 0
     const stream = next(e)
     for await (const chunk of stream) {
-      if (isMain && first === null) {
-        const at = await $.clock.now()
-        first = at
-        await update($, live, lv => ({ ...lv, streamingSince: at }))
+      if (isMain) {
+        if (first === null) {
+          const at = await $.clock.now()
+          first = at
+          wallStart = Date.now()
+          lastWrite = wallStart
+          await update($, live, lv => ({ ...lv, streamingSince: at, liveTps: null }))
+        }
+        if (chunk.kind === 'text' || chunk.kind === 'thinking') chars += chunk.text.length
+        else if (chunk.kind === 'input') chars += chunk.json.length
+        const wall = Date.now()
+        if (wall - lastWrite >= 1000 && chars > 0) {
+          lastWrite = wall
+          const rate = chars / 4 / ((wall - wallStart) / 1000)
+          await update($, live, lv => ({ ...lv, liveTps: rate }))
+        }
       }
       yield chunk
     }
@@ -553,6 +572,7 @@ export const register: Register = on => {
       await update($, live, lv => ({
         ...lv,
         streamingSince: null,
+        liveTps: null,
         lastTps: out > 0 ? out / (ms / 1000) : lv.lastTps,
         turnOutput: lv.turnOutput + out,
         turnGenMs: lv.turnGenMs + (out > 0 ? ms : 0),
@@ -691,7 +711,7 @@ export const register: Register = on => {
     const turnNo = last?.n ?? 0
     const elapsed =
       lv.turnStartedAt === null ? null : (lv.isRunning ? t : (lv.turnEndedAt ?? t)) - lv.turnStartedAt
-    const tps = lv.lastTps
+    const tps = lv.streamingSince !== null && lv.liveTps !== null ? lv.liveTps : lv.lastTps
     const avgTps = lv.turnGenMs > 0 ? lv.turnOutput / (lv.turnGenMs / 1000) : null
     const cacheLeft = lv.lastResponseAt === null ? null : lv.lastResponseAt + CACHE_TTL_MS - t
     const cacheColor =
@@ -772,9 +792,9 @@ export const register: Register = on => {
         ),
       },
       {
-        // Speed: the last response's output tokens per second.
+        // Speed: live while a response streams, the last response's rate otherwise.
         text: `⚡  ${tps === null ? '—' : Math.round(tps)}/s`,
-        keep: 60,
+        keep: 85,
         node: (
           <Text>
             <Text>⚡ </Text>
@@ -799,7 +819,8 @@ export const register: Register = on => {
     ]
 
     // Fit the row beside the button: drop the least needed groups first; the time stays.
-    const GAP = '    '
+    // Two cells between groups: apart enough to read as groups, close enough to scan.
+    const GAP = '  '
     const room = e.props.bodyColumns - 6
     const kept = [...chips]
     const width = (list: Chip[]) =>

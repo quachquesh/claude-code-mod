@@ -86,6 +86,8 @@ export type Live = {
   streamingSince: number | null
   /** Output tokens per second of the main thread's last response. */
   lastTps: number | null
+  /** While a response streams: its rate so far, estimated from the text that arrived. */
+  liveTps: number | null
   /** Output tokens and generation time summed over the current turn's main responses. */
   turnOutput: number
   turnGenMs: number
