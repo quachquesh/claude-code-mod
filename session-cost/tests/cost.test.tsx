@@ -262,27 +262,80 @@ test('the band leads with the turn, drops the words, and always keeps the time',
   }
 })
 
-test('the agents tab costs each subagent, and the summary has a Subagents line', async ($, on) => {
+test('the agents tab lists each subagent as a card, grouped by status', async ($, on) => {
   engine(on)
   await play($)
 
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
-  let line = (await ui.findAll({ type: 'Text' })).map(x => x.text).join('\n')
+  let line = (await ui.findAll({ type: 'Text' })).map(x => x.text).join(String.fromCharCode(10))
   expect(line).toContain('↳ Subagents')
   expect(line).toContain('1 agents')
 
   await ui.press({ key: 'tab-agents' })
-  line = (await ui.findAll({ type: 'Text' })).map(x => x.text).join('\n')
-  expect(line).toContain('general-purpose') // its type
-  expect(line).toContain('research · completed · turn #2 · 1 req')
-  expect(line).toContain('haiku-5-5') // its model
-  expect(line).toContain('$0.6000') // its cost
+  line = (await ui.findAll({ type: 'Text' })).map(x => x.text).join(String.fromCharCode(10))
+  expect((await ui.find({ type: 'Button', key: 'agent-agent-1' }))?.props.label).toBe('research') // its task names the card
+  expect(line).toContain('general-purpose Haiku 5.5') // its type and model
+  expect(line).toContain('≈$0.6000') // its cost
   expect(line).toContain('Main thread')
   expect(line).toContain('$7.22') // main = 7.82 - 0.60
-  expect(line).toContain('1 subagents · $0.6000 in all')
-  // The TTL switch is gone.
-  expect(await ui.find({ type: 'Button', key: 'ttl' })).toBeUndefined()
+  const group = await ui.find({ type: 'Button', key: 'fold-finished' })
+  expect(group?.props.label).toBe('▾ Finished · 1')
+  expect(await ui.find({ type: 'Button', key: 'agent-agent-1' })).toBeDefined()
+
+  // Folding the group hides its cards.
+  await ui.press({ key: 'fold-finished' })
+  expect(await ui.find({ type: 'Button', key: 'agent-agent-1' })).toBeUndefined()
   await ui.unmount()
+})
+
+test("a subagent's page shows its requests, token costs, tools and task", async ($, on) => {
+  engine(on)
+  on('agent.spawn', () => ({ model: 'claude-opus-5-5', agentId: 'agent-2' }))
+  await play($)
+  // A second subagent, spawned with a task, calls tools and answers twice.
+  await $.agent.spawn({
+    tool_use_id: 'tu1',
+    prompt: 'Find where the  ledger is written.',
+    description: 'trace ledger',
+    subagentType: 'Explore',
+    provider: { plugin: 'engine', tier: 'core' },
+  } as never)
+  await $.turn.start({ turnId: 'sub-2', text: 'Find where the ledger is written.', agentId: 'agent-2' } as never)
+  await $.tool.call({ tool: 'Grep', pattern: 'ledger', agentId: 'agent-2' } as never)
+  await $.tool.call({ tool: 'Grep', pattern: 'ledger', agentId: 'agent-2' } as never)
+  await $.tool.call({ tool: 'Read', file_path: 'a.ts', agentId: 'agent-2' } as never)
+  await step($, 'sub-2', 'claude-opus-5-5', 'agent-2')
+  await step($, 'sub-2', 'claude-opus-5-5', 'agent-2')
+  await $.turn.complete({ turnId: 'sub-2', agentId: 'agent-2', answer: 'In register.tsx.', durationMs: 5000, isAborted: false, reason: 'completed' } as never)
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: 'tab-agents' })
+  await ui.press({ key: 'agent-agent-2' })
+  const line = (await ui.findAll({ type: 'Text' })).map(x => x.text).join(String.fromCharCode(10))
+  expect(line).toContain('trace ledger')
+  expect(line).toContain('Explore Opus 5.5')
+  expect(line).toContain('≈$14.40') // two Opus responses at $7.20
+  expect(line).toContain('Find where the ledger is written.') // the task, whitespace folded
+  expect(line).toContain('In register.tsx.') // its answer
+  expect(line).toContain('Grep')
+  expect(line).toContain('3 calls')
+  expect(line).toContain('Cost by token type')
+  const strip = (await ui.findAll({ type: 'Svg' })).find(x => x.props.alt === '2 requests, $14.40 in all')
+  expect(String(strip?.props.source ?? '')).toContain('Request 2')
+
+  // Back to the list.
+  await ui.press({ key: 'agent-back' })
+  expect(await ui.find({ type: 'Button', key: 'agent-agent-2' })).toBeDefined()
+  await ui.unmount()
+
+  // With an agent's transcript in view, the tab opens on its page.
+  const viewing = await $.ui.mount({ ...PANE, props: { ...PANE.props, view: { agentId: 'agent-2' } }, surface: 'terminal' })
+  await viewing.press({ key: 'tab-agents' })
+  const text = (await viewing.findAll({ type: 'Text' })).map(x => x.text).join(String.fromCharCode(10))
+  expect(text).toContain('trace ledger')
+  expect(text).toContain('██') // the terminal's sparkline, a cell a request
+  expect(text).toContain('$7.20 max')
+  await viewing.unmount()
 })
 
 test('the chart splits each turn into main thread and subagents, with hover tooltips', async ($, on) => {

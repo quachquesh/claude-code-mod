@@ -1,7 +1,20 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { AgentRow, ChartMode, ContextFill, Ledger, Live, ModelRow, Tab, Tokens, TurnAgentRow, TurnRow } from '../types'
+import type {
+  AgentGroup,
+  AgentRow,
+  AgentStep,
+  ChartMode,
+  ContextFill,
+  Ledger,
+  Live,
+  ModelRow,
+  Tab,
+  Tokens,
+  TurnAgentRow,
+  TurnRow,
+} from '../types'
 
 const PANE = 'session-cost'
 const TITLE = 'Session cost'
@@ -41,8 +54,12 @@ const contextFill = atom({ plugin: 'session-cost', key: 'context' } as const, nu
 const chartMode = atom({ plugin: 'session-cost', key: 'chartMode' } as const, 'source' as ChartMode)
 const selectedTurn = atom({ plugin: 'session-cost', key: 'selectedTurn' } as const, null as number | null)
 const agentCosts = atom({ plugin: 'session-cost', key: 'agents' } as const, {} as Record<string, AgentRow>, {
-  shape: 'agents-1',
+  shape: 'agents-2',
 })
+const selectedAgent = atom({ plugin: 'session-cost', key: 'selectedAgent' } as const, null as string | null)
+const folded = atom({ plugin: 'session-cost', key: 'folded' } as const, {} as Partial<Record<AgentGroup, boolean>>)
+const startedAt = atom({ plugin: 'session-cost', key: 'startedAt' } as const, null as number | null)
+const MAX_STEPS = 80
 // The main thread's prompt cache is taken to live an hour after its last response.
 const CACHE_TTL_MS = 60 * 60_000
 const now = atom({ plugin: 'session-cost', key: 'now' } as const, 0)
@@ -400,12 +417,212 @@ const pillSvg = (percent: number | null, tone: string): string => {
 }
 
 // ---------------------------------------------------------------------------
+// The pane's drawing kit: model names and colours, compact figures, thin bars.
+// ---------------------------------------------------------------------------
+
+/** A model family's colour: the stripe on its agent's card. */
+const familyColor = (model: string | undefined) => {
+  const id = (model ?? '').toLowerCase()
+  if (id.includes('opus')) return '#B36BE0'
+  if (id.includes('sonnet')) return '#5B8DEF'
+  if (id.includes('haiku')) return '#3FB8AF'
+  if (id.includes('fable') || id.includes('mythos')) return '#F2A541'
+  return '#9AA0A6'
+}
+
+/** "claude-haiku-5-5-20261001[1m]" -> "Haiku 5.5". */
+const prettyModel = (model: string | undefined) => {
+  if (!model) return ''
+  const parts = model
+    .replace(/\[.*?\]$/, '')
+    .replace(/^.*?claude-/, '')
+    .split('-')
+    .filter(p => !/^\d{8}$/.test(p))
+  const [family, ...version] = parts
+  if (!family) return model
+  return `${family[0]?.toUpperCase() ?? ''}${family.slice(1)}${version.length > 0 ? ` ${version.join('.')}` : ''}`
+}
+
+/** Tokens the way a glance reads them: 940, 5.8k, 58k, 1.2M. */
+const ktok = (n: number) =>
+  n >= 1_000_000
+    ? `${(n / 1_000_000).toFixed(1)}M`
+    : n >= 10_000
+      ? `${Math.round(n / 1000)}k`
+      : n >= 1_000
+        ? `${(n / 1000).toFixed(1)}k`
+        : `${n}`
+
+const sumTokens = (t: Tokens) => t.input + t.output + t.cacheRead + t.cacheWrite
+
+/** One line's bar on a desktop: a rounded track and its fill. */
+const railSvg = (width: number, fraction: number, color: string, height = 4): string => {
+  const W = Math.max(8, Math.round(width))
+  const r = height / 2
+  const f = Math.max(0, Math.min(1, fraction)) * W
+  const w = f > 0 ? Math.max(height, f) : 0
+  return (
+    `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${W} ${height}" width="${W}" height="${height}">` +
+    `<rect width="${W}" height="${height}" rx="${r}" fill="#8b949e" fill-opacity="0.22"/>` +
+    (w > 0 ? `<rect width="${w.toFixed(1)}" height="${height}" rx="${r}" fill="${color}"/>` : '') +
+    `</svg>`
+  )
+}
+
+/** A bar split into parts, each its colour, in a rounded track. */
+const splitSvg = (width: number, parts: ReadonlyArray<{ value: number; color: string }>, height = 8): string => {
+  const W = Math.max(8, Math.round(width))
+  const whole = parts.reduce((n, p) => n + Math.max(0, p.value), 0)
+  const out = [
+    `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${W} ${height}" width="${W}" height="${height}">`,
+    `<defs><clipPath id="s"><rect width="${W}" height="${height}" rx="${height / 2}"/></clipPath></defs>`,
+    `<rect width="${W}" height="${height}" rx="${height / 2}" fill="#8b949e" fill-opacity="0.22"/>`,
+    '<g clip-path="url(#s)">',
+  ]
+  let x = 0
+  for (const p of parts) {
+    if (whole <= 0 || p.value <= 0) continue
+    const w = (p.value / whole) * W
+    out.push(`<rect x="${x.toFixed(1)}" width="${(w + 0.5).toFixed(1)}" height="${height}" fill="${p.color}"/>`)
+    x += w
+  }
+  out.push('</g></svg>')
+  return out.join('')
+}
+
+/** The same bar on a terminal: cells of blocks, each part its colour. */
+const splitCells = (cells: number, parts: ReadonlyArray<{ value: number; color: string }>) => {
+  const whole = parts.reduce((n, p) => n + Math.max(0, p.value), 0)
+  let used = 0
+  const out: Array<{ n: number; color: string }> = []
+  for (const p of parts) {
+    if (whole <= 0 || p.value <= 0) continue
+    const n = Math.min(cells - used, Math.max(1, Math.round((p.value / whole) * cells)))
+    if (n > 0) out.push({ n, color: p.color })
+    used += Math.max(0, n)
+  }
+  return { parts: out, rest: Math.max(0, cells - used) }
+}
+
+/** What a step cost by token type, at its model's price. */
+const stepParts = (s: AgentStep) => {
+  const c = costOf({ ...s, requests: 1 }) ?? ZERO
+  return { input: c.input, cacheWrite: c.cacheWrite, cacheRead: c.cacheRead, output: c.output }
+}
+
+const SPARK = '▁▂▃▄▅▆▇█'
+const spark = (values: readonly number[]) => {
+  const max = Math.max(...values, 1e-12)
+  return values.map(v => SPARK[Math.min(7, Math.round((v / max) * 7))] ?? '▁').join('')
+}
+
+/**
+ * A subagent's requests in order, each a bar stacked by what its tokens cost, with
+ * the running total drawn over them; a bar's hover shows its figures.
+ */
+const stepsSvg = (steps: readonly AgentStep[], width: number, height: number, startedAt: number | null): string => {
+  const W = Math.round(width)
+  const H = Math.round(height)
+  const left = 52
+  const right = 52
+  const top = 12
+  const bottom = 22
+  const plotW = W - left - right
+  const plotH = H - top - bottom
+  const max = Math.max(...steps.map(s => s.usd), 0.000001)
+  const totalUsd = steps.reduce((n, s) => n + s.usd, 0)
+  const slot = plotW / Math.max(steps.length, 1)
+  const barW = Math.max(2, Math.min(28, slot * 0.68))
+  const y = (v: number) => top + plotH - (v / max) * plotH
+  const yc = (v: number) => top + plotH - (v / Math.max(totalUsd, 1e-9)) * plotH
+  const series = CATEGORY_SERIES.filter(s => s.key !== 'search' && s.key !== 'other')
+  const css = [
+    '.t{display:none;pointer-events:none}',
+    '.b .hit{fill:transparent}',
+    '.b:hover .hit{fill:#8882}',
+    ...steps.map((_, i) => `.b${i}:hover~.t${i}{display:inline}`),
+  ].join('')
+  const out: string[] = [
+    `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${W} ${H}" width="${W}" height="${H}" font-family="system-ui, sans-serif" font-size="11"><style>${css}</style>`,
+  ]
+  for (const f of [0, 0.5, 1]) {
+    const yy = y(max * f)
+    out.push(`<line x1="${left}" x2="${W - right}" y1="${yy}" y2="${yy}" stroke="#8884"${f === 0 ? '' : ' stroke-dasharray="2 4"'}/>`)
+    out.push(`<text x="${left - 6}" y="${yy + 4}" text-anchor="end" fill="#888">${xml(usd(max * f))}</text>`)
+  }
+  let acc = 0
+  const line: string[] = []
+  steps.forEach((s, i) => {
+    const x = left + i * slot + (slot - barW) / 2
+    const parts = stepParts(s)
+    out.push(`<g class="b b${i}"><rect class="hit" x="${left + i * slot}" y="${top}" width="${slot}" height="${plotH}"/>`)
+    let stack = 0
+    for (const k of series) {
+      const v = parts[k.key as keyof typeof parts]
+      if (v <= 0) continue
+      const y1 = y(stack + v)
+      out.push(`<rect x="${x.toFixed(1)}" y="${y1.toFixed(1)}" width="${barW.toFixed(1)}" height="${Math.max(0.5, y(stack) - y1).toFixed(1)}" fill="${k.color}"/>`)
+      stack += v
+    }
+    out.push('</g>')
+    acc += s.usd
+    line.push(`${(x + barW / 2).toFixed(1)},${yc(acc).toFixed(1)}`)
+  })
+  // The running total, on its own scale at the right.
+  if (steps.length > 1) {
+    out.push(`<polyline points="${line.join(' ')}" fill="none" stroke="#c9c9cf" stroke-width="1.5" stroke-linejoin="round" opacity="0.8"/>`)
+  }
+  out.push(`<text x="${W - right + 6}" y="${yc(totalUsd) + 4}" fill="#c9c9cf">${xml(usd(totalUsd))}</text>`)
+  out.push(`<text x="${W - right + 6}" y="${top + plotH + 4}" fill="#888">total</text>`)
+  // The time axis: the first and the last request, from the agent's start.
+  const first = steps[0]
+  const last = steps[steps.length - 1]
+  if (first && last && startedAt !== null) {
+    out.push(`<text x="${left}" y="${H - 6}" fill="#888">${dur(first.at - startedAt)}</text>`)
+    out.push(`<text x="${W - right}" y="${H - 6}" text-anchor="end" fill="#888">${dur(last.at - startedAt)}</text>`)
+  }
+  steps.forEach((s, i) => {
+    const tps = s.ms >= 250 && s.output > 0 ? Math.round(s.output / (s.ms / 1000)) : null
+    const lines = [
+      `Request ${i + 1}${startedAt === null ? '' : ` at ${dur(s.at - startedAt)}`}   ${usd(s.usd)}`,
+      `${prettyModel(s.model)}${tps === null ? '' : `, ${tps} tok/s`}`,
+      `Input ${ktok(s.input)}   Output ${ktok(s.output)}`,
+      `Cache read ${ktok(s.cacheRead)}   write ${ktok(s.cacheWrite)}`,
+    ]
+    const tw = Math.min(W - 8, Math.max(...lines.map(l => l.length)) * 6.6 + 24)
+    const th = lines.length * 16 + 12
+    const cx = left + i * slot + slot / 2
+    const tx = Math.max(4, Math.min(W - tw - 4, cx < W / 2 ? cx + 10 : cx - 10 - tw))
+    out.push(`<g class="t t${i}" transform="translate(${tx.toFixed(1)},${top})">`)
+    out.push(`<rect width="${tw.toFixed(1)}" height="${th}" rx="6" fill="#1e1e22" stroke="#555" opacity="0.97"/>`)
+    lines.forEach((l, k) => {
+      out.push(`<text x="10" y="${20 + k * 16}" fill="${k === 0 ? '#ececf1' : '#a8a8b0'}"${k === 0 ? ' font-weight="600"' : ''} xml:space="preserve">${xml(l)}</text>`)
+    })
+    out.push('</g>')
+  })
+  out.push('</svg>')
+  return out.join('')
+}
+
+const RUNNING = new Set(['running', 'pending', 'waiting'])
+
+const statusMark = (status: string, isAborted?: boolean) =>
+  RUNNING.has(status)
+    ? { glyph: '●', color: 'success', word: status === 'running' ? 'Running' : status === 'pending' ? 'Starting' : 'Waiting' }
+    : status === 'failed'
+      ? { glyph: '✕', color: 'error', word: 'Failed' }
+      : status === 'killed' || isAborted
+        ? { glyph: '■', color: 'warning', word: 'Stopped' }
+        : { glyph: '✓', color: 'success', word: 'Finished' }
+
+// ---------------------------------------------------------------------------
 // Engine calls (top-level so the engine can follow `$`).
 // ---------------------------------------------------------------------------
 async function refreshTotal($: EngineInterface) {
   const usage = await $.session.usage()
   const value = usage.cost?.usd ?? null
   await update($, total, () => value)
+  if (usage.startedAt > 0) await update($, startedAt, v => v ?? usage.startedAt)
   return value
 }
 
@@ -441,6 +658,23 @@ async function describeAgent($: EngineInterface, id: string) {
     : { type: 'fork', description: 'engine fork (compaction, memory, workflow)' }
 }
 
+
+/** A subagent's row before its first response. */
+const blankAgent = (id: string, type: string, description: string, turn: number): AgentRow => ({
+  id,
+  type,
+  description,
+  requests: 0,
+  models: {},
+  webSearches: 0,
+  turn,
+  contextTokens: 0,
+  outputMs: 0,
+  steps: [],
+  tools: {},
+})
+
+const clean = (s: string, n: number) => clip(s.replace(/\s+/g, ' ').trim(), n)
 
 let ticker: { cancel: () => void } | undefined
 
@@ -482,6 +716,17 @@ export const register: Register = on => {
 
   // A main-thread turn begins: open a row, note the total it starts from.
   on('turn.start', async ($, e, next) => {
+    const agentId = e.agentId
+    if (agentId !== undefined) {
+      const at = await $.clock.now()
+      const known = (await read($, agentCosts))[agentId]
+      const meta = known ?? (await describeAgent($, agentId))
+      const turnNo = (await read($, ledger)).turnCount
+      await update($, agentCosts, all => {
+        const prev = all[agentId] ?? blankAgent(agentId, meta.type, meta.description, turnNo)
+        return { ...all, [agentId]: { ...prev, startedAt: prev.startedAt ?? at, endedAt: undefined } }
+      })
+    }
     if (e.agentId === undefined) {
       const before = await read($, total)
       await update($, ledger, l => {
@@ -516,6 +761,25 @@ export const register: Register = on => {
 
   on('turn.complete', async ($, e, next) => {
     const ran = await next(e)
+    const agentId = e.agentId
+    if (agentId !== undefined) {
+      const at = await $.clock.now()
+      const answer = 'answer' in e && typeof e.answer === 'string' ? e.answer : ''
+      await update($, agentCosts, all => {
+        const row = all[agentId]
+        if (!row) return all
+        return {
+          ...all,
+          [agentId]: {
+            ...row,
+            startedAt: row.startedAt ?? at - e.durationMs,
+            endedAt: at,
+            answer: answer ? clean(answer, 600) : row.answer,
+            isAborted: e.isAborted,
+          },
+        }
+      })
+    }
     if (e.agentId === undefined) {
       const ended = await $.clock.now()
       await update($, live, lv => ({ ...lv, isRunning: false, turnEndedAt: ended, streamingSince: null }))
@@ -534,7 +798,7 @@ export const register: Register = on => {
   // Every model response, main thread and subagents: its token counts.
   on('turn.step', async function* ($, e, next) {
     const isMain = e.agentId === undefined
-    const begun = isMain ? await $.clock.now() : 0
+    const begun = await $.clock.now()
     let first: number | null = null
     // The live rate, while the response streams: the characters that arrived (text,
     // visible thinking, tool arguments) at about four to a token, over the real time
@@ -544,6 +808,7 @@ export const register: Register = on => {
     let lastWrite = 0
     const stream = next(e)
     for await (const chunk of stream) {
+      if (!isMain && first === null) first = await $.clock.now()
       if (isMain) {
         if (first === null) {
           const at = await $.clock.now()
@@ -564,10 +829,10 @@ export const register: Register = on => {
       yield chunk
     }
     const r = await stream.result
+    // Output tokens over the time from the first streamed piece to the end.
+    const end = await $.clock.now()
+    const ms = Math.max(1, end - (first ?? begun))
     if (isMain) {
-      // Output tokens over the time from the first streamed piece to the end.
-      const end = await $.clock.now()
-      const ms = Math.max(1, end - (first ?? begun))
       const out = r.usage?.output_tokens ?? 0
       await update($, live, lv => ({
         ...lv,
@@ -588,17 +853,35 @@ export const register: Register = on => {
       meta = { type: found.type, description: found.description }
       const m = meta
       const turnNo = (await read($, ledger)).turnCount
+      const one = addUsage({}, u.model, u)[u.model]
+      const c = one ? costOf(one) : null
+      const s: AgentStep = {
+        model: u.model,
+        at: end,
+        ms,
+        input: u.input_tokens,
+        output: u.output_tokens,
+        cacheRead: u.cache_read_input_tokens,
+        cacheWrite: u.cache_creation_input_tokens,
+        usd: c === null ? 0 : sumCost(c),
+      }
+      const effort = e.effort === undefined ? undefined : String(e.effort)
       await update($, agentCosts, all => {
-        const prev: AgentRow = all[agentId] ?? {
-          id: agentId,
-          type: m.type,
-          description: m.description,
-          requests: 0,
-          models: {},
-          webSearches: 0,
-          turn: turnNo,
+        const prev: AgentRow = all[agentId] ?? blankAgent(agentId, m.type, m.description, turnNo)
+        return {
+          ...all,
+          [agentId]: {
+            ...prev,
+            requests: prev.requests + 1,
+            models: addUsage(prev.models, u.model, u),
+            model: u.model,
+            effort: effort ?? prev.effort,
+            startedAt: prev.startedAt ?? begun,
+            contextTokens: u.input_tokens + u.cache_read_input_tokens + u.cache_creation_input_tokens,
+            outputMs: prev.outputMs + (u.output_tokens > 0 ? ms : 0),
+            steps: [...prev.steps, s].slice(-MAX_STEPS),
+          },
         }
-        return { ...all, [agentId]: { ...prev, requests: prev.requests + 1, models: addUsage(prev.models, u.model, u) } }
       })
     }
     const servers = r.serverToolUses ?? []
@@ -648,6 +931,38 @@ export const register: Register = on => {
     }
 
     return r
+  })
+
+  // A subagent starts: its row, with the task it was given, before its first response.
+  on('agent.spawn', async ($, e, next) => {
+    const r = await next(e)
+    const agentId = r.agentId
+    if (agentId !== undefined) {
+      const turnNo = (await read($, ledger)).turnCount
+      const at = await $.clock.now()
+      await update($, agentCosts, all => {
+        const prev = all[agentId] ?? blankAgent(agentId, e.subagentType, e.description, turnNo)
+        return {
+          ...all,
+          [agentId]: { ...prev, prompt: clean(e.prompt, 600), model: prev.model ?? r.model, startedAt: prev.startedAt ?? at },
+        }
+      })
+    }
+
+    return r
+  })
+
+  // Each tool a subagent calls, counted on its page.
+  on('tool.call', async ($, e, next) => {
+    const agentId = e.agentId
+    if (agentId !== undefined) {
+      await update($, agentCosts, all => {
+        const row = all[agentId]
+        return row ? { ...all, [agentId]: { ...row, tools: { ...row.tools, [e.tool]: (row.tools[e.tool] ?? 0) + 1 } } } : all
+      })
+    }
+
+    return next(e)
   })
 
   // Web search is billed per search ($10 / 1,000) on top of tokens.
@@ -855,20 +1170,29 @@ export const register: Register = on => {
     const l = await read($, ledger)
     const engineTotal = await read($, total)
     const current = await read($, tab)
+    const ticked = await read($, now)
+    const t = ticked > 0 ? ticked : await $.clock.now()
+    const began = await read($, startedAt)
+    const ctxFill = await read($, contextFill)
+    const ctxWindow = ctxFill && ctxFill.window > 0 ? ctxFill.window : 200_000
     const agentRows = Object.values(await read($, agentCosts))
     const listed = await $.agent.list()
+
     const agentView = agentRows
       .map(a => {
         const priced = priceRows(a.models)
         const cost = sumCost(priced.cost) + a.webSearches * WEB_SEARCH_USD
-        const tokens = Object.values(a.models).reduce(
-          (n, m) => n + m.input + m.output + m.cacheRead + m.cacheWrite,
-          0,
-        )
-        const status = listed.find(x => x.id === a.id)?.status ?? 'done'
-        return { ...a, cost, tokens, status }
+        const tokens = Object.values(a.models).reduce((n, m) => n + sumTokens(m), 0)
+        const status = listed.find(x => x.id === a.id)?.status ?? (a.isAborted ? 'killed' : 'completed')
+        const isRunning = RUNNING.has(status)
+        const lastAt = a.steps[a.steps.length - 1]?.at
+        const end = isRunning ? t : (a.endedAt ?? lastAt ?? null)
+        const elapsed = a.startedAt === undefined || end === null ? null : Math.max(0, end - a.startedAt)
+        const ctxPct = a.contextTokens > 0 ? Math.min(100, (a.contextTokens / ctxWindow) * 100) : null
+        return { ...a, cost, tokens, status, isRunning, elapsed, ctxPct }
       })
-      .sort((x, y) => y.cost - x.cost)
+      .sort((x, y) => Number(y.isRunning) - Number(x.isRunning) || (y.startedAt ?? 0) - (x.startedAt ?? 0))
+    type AgentView = (typeof agentView)[number]
     const subUsd = agentView.reduce((n, a) => n + a.cost, 0)
 
     const rows = Object.values(l.models)
@@ -887,21 +1211,24 @@ export const register: Register = on => {
     const computed = sumCost(sum) + searchUsd
     const other = engineTotal === null ? null : engineTotal - computed
     const shown = engineTotal ?? computed
-    const totalTokens = toks.input + toks.output + toks.cacheRead + toks.cacheWrite
+    const totalTokens = sumTokens(toks)
     const inputSide = toks.input + toks.cacheRead + toks.cacheWrite
     const hitRate = inputSide === 0 ? null : (toks.cacheRead / inputSide) * 100
     const requests = rows.reduce((a, r) => a + r.requests, 0)
 
     const cols = e.props.bodyColumns
     const narrow = cols < 46
+    // About how many pixels a column takes on a desktop, to size the drawings.
+    const PX = 7.5
     const W_LABEL = narrow ? 13 : 16
     const W_TOK = narrow ? 8 : 10
     const W_USD = 10
     const W_PCT = narrow ? 0 : 5
 
-    const Row = (p: { label: string; tokens?: string; cost: string; share?: string; dim?: boolean; bold?: boolean; indent?: boolean }) => (
+    const Row = (p: { label: string; tokens?: string; cost: string; share?: string; dim?: boolean; bold?: boolean; indent?: boolean; swatch?: string }) => (
       <Box flexDirection="row">
-        <Box width={W_LABEL}>
+        <Box width={W_LABEL} flexDirection="row">
+          {p.swatch && <Text color={p.swatch}>■ </Text>}
           <Text dimColor={p.dim} bold={p.bold} wrap="truncate-end">
             {p.indent ? `  ${p.label}` : p.label}
           </Text>
@@ -920,21 +1247,75 @@ export const register: Register = on => {
       </Box>
     )
 
+    /** A figure in a framed tile: a small label over a large value. */
+    const Tile = (p: { label: string; value: string; color?: string; width: number }) => (
+      <Box flexDirection="column" width={p.width} borderStyle="round" borderColor="subtle" paddingX={1}>
+        <Text dimColor wrap="truncate-end">{p.label}</Text>
+        <Text bold color={p.color} wrap="truncate-end">
+          {p.value}
+        </Text>
+      </Box>
+    )
+    const Tiles = (p: { items: ReadonlyArray<{ label: string; value: string; color?: string }> }) => {
+      const gap = 1
+      const width = Math.max(8, Math.floor((cols - gap * (p.items.length - 1)) / p.items.length))
+      return (
+        <Box flexDirection="row" gap={gap}>
+          {p.items.map(i => (
+            <Tile label={i.label} value={i.value} color={i.color} width={width} />
+          ))}
+        </Box>
+      )
+    }
+
+    /** A bar of parts the width of `cells` columns: an Svg on a desktop, blocks on a terminal. */
+    const Split = (p: { cells: number; parts: ReadonlyArray<{ value: number; color: string }>; alt: string; height?: number }) => {
+      if (Svg) {
+        const w = Math.round(p.cells * PX)
+        const tall = p.height ?? 8
+        return <Svg source={splitSvg(w, p.parts, tall)} width={w} height={tall} alt={p.alt} />
+      }
+      const cells = splitCells(p.cells, p.parts)
+      return (
+        <Text>
+          {cells.parts.map(c => (
+            <Text color={c.color}>{'━'.repeat(c.n)}</Text>
+          ))}
+          <Text dimColor>{'━'.repeat(cells.rest)}</Text>
+        </Text>
+      )
+    }
+
+    const Heading = (p: { text: string; hint?: string }) => (
+      <Box flexDirection="row" marginTop={1} gap={1}>
+        <Text bold>{p.text}</Text>
+        {p.hint && <Text dimColor>{p.hint}</Text>}
+      </Box>
+    )
+
+    const agentCount = agentView.length
+    const runningCount = agentView.filter(a => a.isRunning).length
     const tabs = (
       <Box flexDirection="row" gap={1}>
         {(
           [
             ['summary', 'Summary', '1'],
             ['models', 'Models', '2'],
-            ['agents', 'Agents', '3'],
+            ['agents', agentCount > 0 ? `Agents ${runningCount > 0 ? `●${runningCount}` : agentCount}` : 'Agents', '3'],
             ['turns', 'Turns', '4'],
           ] as const
         ).map(([id, label, hotkey]) => (
           <Button
             key={`tab-${id}`}
-            label={current === id ? `● ${label}` : label}
+            label={label}
             hotkey={hotkey}
-            onPress={() => update($, tab, () => id)}
+            variant={current === id ? 'primary' : undefined}
+            dimColor={current === id ? undefined : true}
+            onPress={async () => {
+              await update($, tab, () => id)
+              // Back to the Agents tab: the list, or the agent whose transcript is in view.
+              if (id === 'agents') await update($, selectedAgent, () => null)
+            }}
           />
         ))}
       </Box>
@@ -942,36 +1323,42 @@ export const register: Register = on => {
 
     const header = (
       <Box flexDirection="column">
-        <Box flexDirection="row">
-          <Text bold>Total </Text>
-          <Text bold color="green">{usd(shown)}</Text>
-          <Text dimColor>{engineTotal === null ? '  (estimate)' : '  (as /cost)'}</Text>
-        </Box>
-        <Text dimColor>
-          {tok(totalTokens)} tokens · {requests} requests
-          {l.subagentRequests > 0 ? ` (${l.subagentRequests} subagent)` : ''}
-          {hitRate === null ? '' : ` · cache hit ${hitRate.toFixed(0)}%`}
+        <Tiles
+          items={[
+            { label: engineTotal === null ? 'Cost (estimate)' : 'Cost', value: usd(shown), color: 'success' },
+            { label: 'Tokens', value: ktok(totalTokens) },
+            { label: 'Time', value: began === null ? '—' : dur(t - began) },
+          ]}
+        />
+        <Text dimColor wrap="truncate-end">
+          {requests} requests
+          {l.subagentRequests > 0 ? `, ${l.subagentRequests} in subagents` : ''}
+          {hitRate === null ? '' : `  ·  cache hit ${hitRate.toFixed(0)}%`}
         </Text>
       </Box>
     )
 
     // --- Summary -----------------------------------------------------------
+    const categoryParts = [
+      { value: sum.input, color: '#5B8DEF' },
+      { value: sum.cacheWrite, color: '#F2A541' },
+      { value: sum.cacheRead, color: '#4CB782' },
+      { value: sum.output, color: '#B36BE0' },
+      { value: searchUsd, color: '#E8697B' },
+      { value: Math.max(0, other ?? 0), color: '#9AA0A6' },
+    ]
     const summary = (
       <Box flexDirection="column">
+        {shown > 0 && <Split cells={cols} parts={categoryParts} alt="The session's cost split by token type" />}
+        <Text> </Text>
         <Row label="Item" tokens="Tokens" cost="USD" share="%" dim />
-        <Row label="Input" tokens={tok(toks.input)} cost={usd(sum.input)} share={pct(sum.input, shown)} />
-        <Row label="Output" tokens={tok(toks.output)} cost={usd(sum.output)} share={pct(sum.output, shown)} />
-        <Row label="Cache write" tokens={tok(toks.cacheWrite)} cost={usd(sum.cacheWrite)} share={pct(sum.cacheWrite, shown)} />
-        <Row label="Cache read" tokens={tok(toks.cacheRead)} cost={usd(sum.cacheRead)} share={pct(sum.cacheRead, shown)} />
-        <Row label="Web search" tokens={`${searchCount}x`} cost={usd(searchUsd)} share={pct(searchUsd, shown)} />
+        <Row label="Input" swatch="#5B8DEF" tokens={tok(toks.input)} cost={usd(sum.input)} share={pct(sum.input, shown)} />
+        <Row label="Output" swatch="#B36BE0" tokens={tok(toks.output)} cost={usd(sum.output)} share={pct(sum.output, shown)} />
+        <Row label="Cache write" swatch="#F2A541" tokens={tok(toks.cacheWrite)} cost={usd(sum.cacheWrite)} share={pct(sum.cacheWrite, shown)} />
+        <Row label="Cache read" swatch="#4CB782" tokens={tok(toks.cacheRead)} cost={usd(sum.cacheRead)} share={pct(sum.cacheRead, shown)} />
+        <Row label="Web search" swatch="#E8697B" tokens={`${searchCount}x`} cost={usd(searchUsd)} share={pct(searchUsd, shown)} />
         {agentView.length > 0 && (
-          <Row
-            label="↳ Subagents"
-            tokens={`${agentView.length} agents`}
-            cost={usd(subUsd)}
-            share={pct(subUsd, shown)}
-            dim
-          />
+          <Row label="↳ Subagents" tokens={`${agentView.length} agents`} cost={usd(subUsd)} share={pct(subUsd, shown)} dim />
         )}
         {l.webFetches > 0 && <Row label="Web fetch" tokens={`${l.webFetches}x`} cost="tokens" dim />}
         {Object.entries(l.serverTools)
@@ -980,7 +1367,7 @@ export const register: Register = on => {
             <Row label={name} tokens={`${n}x`} cost="tokens" dim />
           ))}
         {other !== null && Math.abs(other) >= 0.00005 && (
-          <Row label="Other" cost={usd(other)} share={pct(other, shown)} dim />
+          <Row label="Other" swatch="#9AA0A6" cost={usd(other)} share={pct(other, shown)} dim />
         )}
       </Box>
     )
@@ -996,13 +1383,16 @@ export const register: Register = on => {
           const subtotal = cost === null ? null : sumCost(cost)
           return (
             <Box flexDirection="column" marginBottom={1}>
-              <Row
-                label={shortModel(row.model)}
-                tokens={`${row.requests} req`}
-                cost={subtotal === null ? '?' : usd(subtotal)}
-                share={subtotal === null ? '' : pct(subtotal, shown)}
-                bold
-              />
+              <Box flexDirection="row">
+                <Text color={familyColor(row.model)}>▍</Text>
+                <Row
+                  label={shortModel(row.model)}
+                  tokens={`${row.requests} req`}
+                  cost={subtotal === null ? '?' : usd(subtotal)}
+                  share={subtotal === null ? '' : pct(subtotal, shown)}
+                  bold
+                />
+              </Box>
               <Row label="Input" indent tokens={tok(row.input)} cost={cost ? usd(cost.input) : '?'} dim />
               <Row label="Output" indent tokens={tok(row.output)} cost={cost ? usd(cost.output) : '?'} dim />
               <Row label="Cache write" indent tokens={tok(row.cacheWrite)} cost={cost ? usd(cost.cacheWrite) : '?'} dim />
@@ -1017,73 +1407,283 @@ export const register: Register = on => {
       </Box>
     )
 
-    // --- Agents ------------------------------------------------------------
-    const mainUsd = computed - subUsd
-    const priciestAgent = agentView[0]
-    const agentsView = (
-      <Box flexDirection="column">
-        {agentView.length === 0 && <Text dimColor>No subagent has run since the mod loaded.</Text>}
-        {agentView.length > 0 && (
-          <Text dimColor>
-            {agentView.length} subagents · {usd(subUsd)} in all · avg {usd(subUsd / agentView.length)}
-            {priciestAgent ? ` · max ${priciestAgent.type} ${usd(priciestAgent.cost)}` : ''}
-          </Text>
-        )}
-        {agentView.length > 0 && <Text> </Text>}
-        <Row label="Item" tokens="Tokens" cost="USD" share="%" dim />
-        <Row label="Main thread" tokens="" cost={usd(Math.max(0, mainUsd))} share={pct(mainUsd, shown)} bold />
-        <Row label="Subagents" tokens={tok(agentView.reduce((n, a) => n + a.tokens, 0))} cost={usd(subUsd)} share={pct(subUsd, shown)} bold />
-        {agentView.map(a => (
-          <Box flexDirection="column" marginTop={1}>
-            <Row
-              label={`${a.status === 'running' || a.status === 'pending' || a.status === 'waiting' ? '● ' : ''}${a.type}`}
-              tokens={tok(a.tokens)}
-              cost={usd(a.cost)}
-              share={pct(a.cost, shown)}
-            />
-            <Text dimColor wrap="truncate-end">
-              {`  ${a.description} · ${a.status} · turn #${a.turn} · ${a.requests} req`}
-              {a.webSearches > 0 ? ` · ${a.webSearches} searches` : ''}
-            </Text>
-            {Object.values(a.models).map(m => {
-              const c = costOf(m)
-              return (
-                <Row
-                  label={shortModel(m.model)}
-                  indent
-                  tokens={tok(m.input + m.output + m.cacheRead + m.cacheWrite)}
-                  cost={c === null ? '?' : usd(sumCost(c))}
-                  dim
-                />
-              )
-            })}
+    // --- Agents: the list ---------------------------------------------------
+    const mainUsd = Math.max(0, computed - subUsd)
+    const priciest = Math.max(...agentView.map(a => a.cost), 1e-9)
+    const fold = await read($, folded)
+    const picked = await read($, selectedAgent)
+    const inView = e.props.view.agentId
+    const pageId = picked === null ? (inView !== undefined && agentView.some(a => a.id === inView) ? inView : null) : picked || null
+    const page = agentView.find(a => a.id === pageId) ?? null
+    const open = (id: string) => update($, selectedAgent, () => id)
+
+    const cardMeta = (a: AgentView) =>
+      [a.ctxPct === null ? null : `ctx ${Math.round(a.ctxPct)}%`, ktok(a.tokens)].filter(Boolean).join(' · ') +
+      `  ≈${usd(a.cost)}` +
+      (a.elapsed === null ? '' : `  ${dur(a.elapsed)}`)
+
+    const Card = (p: { a: AgentView }) => {
+      const a = p.a
+      const mark = statusMark(a.status, a.isAborted)
+      const inner = cols - 3
+      return (
+        <Box key={`card-${a.id}`} flexDirection="row" paddingY={0} marginTop={1} hover={{ backgroundColor: '#8b949e1f' }}>
+          <Box width={2} flexShrink={0}>
+            <Text color={familyColor(a.model)}>▍</Text>
           </Box>
-        ))}
+          <Box flexDirection="column" flexGrow={1} flexShrink={1}>
+            <Box flexDirection="row" justifyContent="space-between">
+              <Button key={`agent-${a.id}`} plain label={a.description || a.type} onPress={() => open(a.id)} />
+              <Text color={mark.color}>{mark.glyph}</Text>
+            </Box>
+            <Text dimColor wrap="truncate-end">
+              {a.type}
+              {a.model ? ` ${prettyModel(a.model)}` : ''}
+              {a.effort ? ` · ${a.effort}` : ''}
+            </Text>
+            <Box flexDirection="row" justifyContent="flex-end">
+              <Text dimColor>{cardMeta(a)}</Text>
+            </Box>
+            {Svg ? (
+              <Svg
+                source={railSvg(inner * PX, a.cost / priciest, a.isRunning ? '#4CB782' : '#8b949e', 4)}
+                width={Math.round(inner * PX)}
+                height={4}
+                alt={`${usd(a.cost)}, ${pct(a.cost, subUsd) || '0%'} of the subagents' cost`}
+              />
+            ) : (
+              <Text>
+                <Text color={a.isRunning ? 'green' : undefined}>{'━'.repeat(Math.round((a.cost / priciest) * inner))}</Text>
+                <Text dimColor>{'╌'.repeat(inner - Math.round((a.cost / priciest) * inner))}</Text>
+              </Text>
+            )}
+          </Box>
+        </Box>
+      )
+    }
+
+    const Group = (p: { id: AgentGroup; label: string; list: AgentView[] }) => {
+      if (p.list.length === 0) return null
+      const isFolded = fold[p.id] === true
+      return (
+        <Box flexDirection="column" marginTop={1}>
+          <Button
+            key={`fold-${p.id}`}
+            plain
+            dimColor
+            label={`${isFolded ? '▸' : '▾'} ${p.label} · ${p.list.length}`}
+            onPress={() => update($, folded, f => ({ ...f, [p.id]: !isFolded }))}
+          />
+          {!isFolded && p.list.map(a => <Card a={a} />)}
+        </Box>
+      )
+    }
+
+    const agentsList = (
+      <Box flexDirection="column">
+        {agentView.length === 0 && (
+          <Text dimColor>No subagent has run yet. Each one the model starts shows here, with its cost as it runs.</Text>
+        )}
+        {agentView.length > 0 && (
+          <Box flexDirection="column">
+            <Box flexDirection="row" justifyContent="space-between">
+              <Text>
+                <Text color="#5B8DEF">■ </Text>
+                <Text>Main thread </Text>
+                <Text bold>{usd(mainUsd)}</Text>
+              </Text>
+              <Text>
+                <Text color="#C77DFF">■ </Text>
+                <Text>Subagents </Text>
+                <Text bold>{usd(subUsd)}</Text>
+                <Text dimColor>{` ${pct(subUsd, mainUsd + subUsd)}`}</Text>
+              </Text>
+            </Box>
+            <Split
+              cells={cols}
+              parts={[
+                { value: mainUsd, color: '#5B8DEF' },
+                { value: subUsd, color: '#C77DFF' },
+              ]}
+              alt={`Main thread ${usd(mainUsd)}, subagents ${usd(subUsd)}`}
+              height={6}
+            />
+          </Box>
+        )}
+        <Group id="running" label="Running" list={agentView.filter(a => a.isRunning)} />
+        <Group id="finished" label="Finished" list={agentView.filter(a => !a.isRunning)} />
       </Box>
     )
 
+    // --- Agents: one agent's page --------------------------------------------
+    const agentPage = (a: AgentView) => {
+      const mark = statusMark(a.status, a.isAborted)
+      const c = priceRows(a.models).cost
+      const tk = Object.values(a.models).reduce<Tokens>(
+        (n, m) => ({
+          input: n.input + m.input,
+          output: n.output + m.output,
+          cacheRead: n.cacheRead + m.cacheRead,
+          cacheWrite: n.cacheWrite + m.cacheWrite,
+        }),
+        ZERO,
+      )
+      const searchesUsd = a.webSearches * WEB_SEARCH_USD
+      const side = tk.input + tk.cacheRead + tk.cacheWrite
+      const hit = side === 0 ? null : Math.round((tk.cacheRead / side) * 100)
+      const tps = a.outputMs >= 250 ? Math.round(tk.output / (a.outputMs / 1000)) : null
+      const modelRows = Object.values(a.models)
+      const tools = Object.entries(a.tools).sort((x, y) => y[1] - x[1])
+      const toolCalls = tools.reduce((n, [, k]) => n + k, 0)
+      const chartW = Math.min(1200, Math.max(360, Math.round(cols * PX)))
+      const index = agentView.findIndex(x => x.id === a.id)
+      const prev = agentView[index - 1]
+      const nextAgent = agentView[index + 1]
+      const lines = [
+        { key: 'input', label: 'Input', color: '#5B8DEF', tokens: tk.input, usd: c.input },
+        { key: 'output', label: 'Output', color: '#B36BE0', tokens: tk.output, usd: c.output },
+        { key: 'cacheWrite', label: 'Cache write', color: '#F2A541', tokens: tk.cacheWrite, usd: c.cacheWrite },
+        { key: 'cacheRead', label: 'Cache read', color: '#4CB782', tokens: tk.cacheRead, usd: c.cacheRead },
+      ]
+      return (
+        <Box flexDirection="column">
+          <Box flexDirection="row" justifyContent="space-between">
+            <Button key="agent-back" plain dimColor label="‹ All agents" onPress={() => update($, selectedAgent, () => '')} />
+            <Box flexDirection="row" gap={1}>
+              {prev && <Button key="agent-prev" plain dimColor label="↑" onPress={() => open(prev.id)} />}
+              {nextAgent && <Button key="agent-next" plain dimColor label="↓" onPress={() => open(nextAgent.id)} />}
+            </Box>
+          </Box>
+          <Box flexDirection="row" marginTop={1} gap={1}>
+            <Text color={familyColor(a.model)}>▍</Text>
+            <Box flexDirection="column" flexShrink={1}>
+              <Text bold wrap="wrap">{a.description || a.type}</Text>
+              <Text dimColor wrap="truncate-end">
+                {a.type}
+                {a.model ? ` ${prettyModel(a.model)}` : ''}
+                {a.effort ? ` · ${a.effort}` : ''}
+                {a.turn > 0 ? ` · from turn #${a.turn}` : ''}
+              </Text>
+              <Text color={mark.color}>
+                {mark.glyph} {mark.word}
+                <Text dimColor>{a.elapsed === null ? '' : ` after ${dur(a.elapsed)}`}</Text>
+              </Text>
+            </Box>
+          </Box>
+          <Box marginTop={1}>
+            <Tiles
+              items={[
+                { label: 'Cost', value: `≈${usd(a.cost)}`, color: 'success' },
+                { label: 'Tokens', value: ktok(a.tokens) },
+                { label: 'Time', value: a.elapsed === null ? '—' : dur(a.elapsed) },
+                ...(narrow ? [] : [{ label: 'Context', value: a.ctxPct === null ? '—' : `${Math.round(a.ctxPct)}%` }]),
+              ]}
+            />
+          </Box>
+
+          <Heading
+            text="Requests"
+            hint={
+              a.steps.length === 0
+                ? undefined
+                : `${a.requests} in all, ≈${usd(a.cost / Math.max(1, a.requests))} each${tps === null ? '' : `, ${tps} tok/s out`}`
+            }
+          />
+          {a.steps.length === 0 && <Text dimColor>No response yet.</Text>}
+          {a.steps.length > 0 && Svg && (
+            <Svg
+              source={stepsSvg(a.steps, chartW, 150, a.startedAt ?? null)}
+              width={chartW}
+              height={150}
+              alt={`${a.steps.length} requests, ${usd(a.cost)} in all`}
+              isInteractive
+            />
+          )}
+          {a.steps.length > 0 && !Svg && (
+            <Box flexDirection="row">
+              <Text color="#B36BE0">{spark(a.steps.slice(-(cols - 12)).map(s => s.usd))}</Text>
+              <Text dimColor> {usd(Math.max(...a.steps.map(s => s.usd)))} max</Text>
+            </Box>
+          )}
+          {a.steps.length > 0 && (
+            <Text dimColor>
+              {lines.map(s => (
+                <Text>
+                  <Text color={s.color}>■</Text>
+                  {` ${s.label}  `}
+                </Text>
+              ))}
+              {a.steps.length > 1 ? '─ running total' : ''}
+            </Text>
+          )}
+
+          <Heading text="Cost by token type" hint={hit === null ? undefined : `cache hit ${hit}%`} />
+          <Split cells={cols} parts={lines.map(s => ({ value: s.usd, color: s.color }))} alt="This agent's cost by token type" />
+          {lines.map(s => (
+            <Row label={s.label} swatch={s.color} tokens={tok(s.tokens)} cost={usd(s.usd)} share={pct(s.usd, a.cost)} />
+          ))}
+          {a.webSearches > 0 && (
+            <Row label="Web search" swatch="#E8697B" tokens={`${a.webSearches}x`} cost={usd(searchesUsd)} share={pct(searchesUsd, a.cost)} />
+          )}
+          {modelRows.length > 1 && <Heading text="Models" />}
+          {modelRows.length > 1 &&
+            modelRows.map(m => {
+              const mc = costOf(m)
+              return (
+                <Row label={shortModel(m.model)} swatch={familyColor(m.model)} tokens={`${m.requests} req`} cost={mc === null ? '?' : usd(sumCost(mc))} share={mc === null ? '' : pct(sumCost(mc), a.cost)} />
+              )
+            })}
+
+          {tools.length > 0 && <Heading text="Tools" hint={`${toolCalls} calls`} />}
+          {tools.length > 0 && (
+            <Box flexDirection="row" flexWrap="wrap" columnGap={2}>
+              {tools.map(([name, n]) => (
+                <Text>
+                  {name}
+                  <Text dimColor>{` ${n}`}</Text>
+                </Text>
+              ))}
+            </Box>
+          )}
+
+          {a.prompt && <Heading text="Task" />}
+          {a.prompt && (
+            <Box borderStyle="round" borderColor="subtle" paddingX={1}>
+              <Text dimColor wrap="wrap">{a.prompt}</Text>
+            </Box>
+          )}
+          {a.answer && <Heading text={a.isRunning ? 'Last answer' : 'Answer'} />}
+          {a.answer && (
+            <Box borderStyle="round" borderColor="subtle" paddingX={1}>
+              <Text wrap="wrap">{a.answer}</Text>
+            </Box>
+          )}
+        </Box>
+      )
+    }
+
     // --- Turns -------------------------------------------------------------
-    const turnViews = l.turns.map(t => viewTurn(t, engineTotal))
+    const turnViews = l.turns.map(tv => viewTurn(tv, engineTotal))
     const maxBars = Svg ? 40 : Math.max(5, (e.props.scroll?.bodyRows ?? 20) - 8)
     const recent = turnViews.slice(-maxBars)
-    const maxUsd = Math.max(...recent.map(t => t.usd), 0.0001)
-    const avg = turnViews.length === 0 ? 0 : turnViews.reduce((a, t) => a + t.usd, 0) / turnViews.length
-    const priciest = turnViews.reduce<TurnView | null>((a, t) => (a === null || t.usd > a.usd ? t : a), null)
+    const maxUsd = Math.max(...recent.map(tv => tv.usd), 0.0001)
+    const avg = turnViews.length === 0 ? 0 : turnViews.reduce((a, tv) => a + tv.usd, 0) / turnViews.length
+    const priciestTurn = turnViews.reduce<TurnView | null>((a, tv) => (a === null || tv.usd > a.usd ? tv : a), null)
     const barCols = Math.max(6, cols - 22)
     const chartW = Math.min(1400, Math.max(480, Math.round(cols * 8)))
     const chartH = Math.min(460, Math.max(280, Math.round(chartW * 0.45)))
     const mode = await read($, chartMode)
-    const picked = await read($, selectedTurn)
-    const shownTurn = turnViews.find(t => t.n === picked) ?? null
+    const pickedTurn = await read($, selectedTurn)
+    const shownTurn = turnViews.find(tv => tv.n === pickedTurn) ?? null
     const series = seriesFor(mode)
     const turnDetail = shownTurn && (
-      <Box flexDirection="column" marginTop={1} borderStyle="round" borderColor="gray" paddingX={1}>
+      <Box flexDirection="column" marginTop={1} borderStyle="round" borderColor="subtle" paddingX={1}>
         <Box flexDirection="row" justifyContent="space-between">
           <Text bold>
             Turn #{shownTurn.n}
             {shownTurn.isOpen ? ' (running)' : ''} · {usd(shownTurn.usd)} · {pct(shownTurn.usd, shown)} of session
           </Text>
-          <Button key="turn-close" label="Close" onPress={() => update($, selectedTurn, () => null)} />
+          <Button key="turn-close" plain dimColor label="Close" onPress={() => update($, selectedTurn, () => null)} />
         </Box>
         {shownTurn.prompt && <Text dimColor wrap="truncate-end">“{shownTurn.prompt}”</Text>}
         <Row label="Main thread" cost={usd(shownTurn.source.main)} share={pct(shownTurn.source.main, shownTurn.usd)} />
@@ -1095,7 +1695,7 @@ export const register: Register = on => {
         <Row label="Other" cost={usd(shownTurn.source.other)} share={pct(shownTurn.source.other, shownTurn.usd)} dim />
         <Text> </Text>
         {CATEGORY_SERIES.filter(s => s.key !== 'search' && s.key !== 'other').map(s => (
-          <Row label={s.label} cost={usd(shownTurn.parts[s.key])} share={pct(shownTurn.parts[s.key], shownTurn.usd)} dim />
+          <Row label={s.label} swatch={s.color} cost={usd(shownTurn.parts[s.key])} share={pct(shownTurn.parts[s.key], shownTurn.usd)} dim />
         ))}
         {shownTurn.byModel.map(m => (
           <Row label={shortModel(m.model)} cost={usd(m.usd)} share={pct(m.usd, shownTurn.usd)} dim />
@@ -1109,17 +1709,21 @@ export const register: Register = on => {
           <Box flexDirection="row" justifyContent="space-between">
             <Text dimColor>
               {turnViews.length} turns · avg {usd(avg)}
-              {priciest ? ` · max #${priciest.n} ${usd(priciest.usd)}` : ''}
+              {priciestTurn ? ` · max #${priciestTurn.n} ${usd(priciestTurn.usd)}` : ''}
             </Text>
             <Box flexDirection="row" gap={1}>
               <Button
                 key="mode-source"
-                label={mode === 'source' ? '● Main / Subagents' : 'Main / Subagents'}
+                label="Main / Subagents"
+                variant={mode === 'source' ? 'primary' : undefined}
+                dimColor={mode === 'source' ? undefined : true}
                 onPress={() => update($, chartMode, () => 'source' as const)}
               />
               <Button
                 key="mode-category"
-                label={mode === 'category' ? '● Token types' : 'Token types'}
+                label="Token types"
+                variant={mode === 'category' ? 'primary' : undefined}
+                dimColor={mode === 'category' ? undefined : true}
                 onPress={() => update($, chartMode, () => 'category' as const)}
               />
             </Box>
@@ -1138,46 +1742,46 @@ export const register: Register = on => {
         )}
         {recent.length > 0 &&
           !Svg &&
-          recent.map(t => {
-            const values = valuesFor(t, mode)
-            const cells = Math.max(1, Math.round((t.usd / maxUsd) * barCols))
+          recent.map(tv => {
+            const values = valuesFor(tv, mode)
+            const cells = Math.max(1, Math.round((tv.usd / maxUsd) * barCols))
             let used = 0
             return (
               <Box flexDirection="row">
                 <Box width={5}>
-                  <Text dimColor>#{t.n}</Text>
+                  <Text dimColor>#{tv.n}</Text>
                 </Box>
                 <Box width={barCols}>
                   <Text>
                     {series.map(s => {
-                      const n = Math.min(cells - used, Math.round(((values[s.key] ?? 0) / Math.max(t.usd, 1e-9)) * cells))
+                      const n = Math.min(cells - used, Math.round(((values[s.key] ?? 0) / Math.max(tv.usd, 1e-9)) * cells))
                       used += Math.max(0, n)
                       return n > 0 ? <Text color={s.color}>{'█'.repeat(n)}</Text> : ''
                     })}
                   </Text>
                 </Box>
-                <Text> {usd(t.usd)}</Text>
+                <Text> {usd(tv.usd)}</Text>
               </Box>
             )
           })}
-        {recent.length > 0 && <Text> </Text>}
-        {recent.length > 0 && <Text dimColor>Press a turn for its breakdown.</Text>}
-        {recent.length > 0 && <Row label="Turn" tokens="Subagents" cost="USD" dim />}
+        {recent.length > 0 && <Heading text="Recent turns" hint="press one for its breakdown" />}
         {[...recent]
           .reverse()
           .slice(0, 10)
-          .map(t => (
+          .map(tv => (
             <Box flexDirection="row">
               <Button
-                key={`turn-${t.n}`}
-                label={picked === t.n ? `● #${t.n}` : `#${t.n}`}
-                onPress={() => update($, selectedTurn, v => (v === t.n ? null : t.n))}
+                key={`turn-${tv.n}`}
+                plain
+                dimColor={pickedTurn === tv.n ? undefined : true}
+                label={`#${tv.n}`}
+                onPress={() => update($, selectedTurn, v => (v === tv.n ? null : tv.n))}
               />
               <Row
-                label={` ${t.prompt}`}
-                tokens={t.byAgent.length > 0 ? `${t.byAgent.length}· ${usd(t.source.subagents)}` : ''}
-                cost={t.isOpen ? `${usd(t.usd)}…` : usd(t.usd)}
-                share={pct(t.usd, shown)}
+                label={` ${tv.prompt}`}
+                tokens={tv.byAgent.length > 0 ? `${tv.byAgent.length}· ${usd(tv.source.subagents)}` : ''}
+                cost={tv.isOpen ? `${usd(tv.usd)}…` : usd(tv.usd)}
+                share={pct(tv.usd, shown)}
               />
             </Box>
           ))}
@@ -1188,21 +1792,21 @@ export const register: Register = on => {
     return (
       <Box flexDirection="column">
         {header}
-        {tabs}
+        <Box marginTop={1}>{tabs}</Box>
         <Text> </Text>
         {current === 'summary' && summary}
         {current === 'models' && modelsView}
-        {current === 'agents' && agentsView}
+        {current === 'agents' && (page ? agentPage(page) : agentsList)}
         {current === 'turns' && turnsView}
         <Text> </Text>
         <Text dimColor>
-          List prices; cache write at the 5m rate (1.25x). "Other" = the /cost total
-          minus the lines above (WebSearch's own model call, 1h cache writes, fast
-          mode, compaction, cost before this mod loaded).
+          List prices, cache writes at the 5-minute rate. "Other" is the /cost total minus the lines
+          itemized here: WebSearch's own model call, 1-hour cache writes, fast mode, compaction, and
+          spend from before the mod loaded.
           {unpriced.length > 0 ? ` No price for: ${unpriced.join(', ')}.` : ''}
         </Text>
         <Box flexDirection="row">
-          <Button key="reset" label="Reset breakdown" onPress={() => update($, ledger, () => EMPTY)} />
+          <Button key="reset" plain dimColor label="Reset breakdown" onPress={() => update($, ledger, () => EMPTY)} />
         </Box>
       </Box>
     )

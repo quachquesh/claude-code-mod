@@ -42,11 +42,11 @@ In the desktop app, where `/plugin` does not run: click **+** next to the prompt
 - `🕒` the time
 - `📊` opens the pane
 
-**The pane** has four tabs:
+**The pane** opens on the session's cost, tokens and time, over four tabs:
 
 - **Summary**: input, output, cache write, cache read, web search, subagents and "Other", in tokens, dollars and share
 - **Models**: each model's input, output and cache, tokens and dollars
-- **Agents**: the main thread against the subagents, and each subagent's cost by model
+- **Agents**: the main thread against the subagents, then a card for each subagent, grouped into Running and Finished: its task, type, model and effort, its context fill, tokens, cost and run time, and a bar of its cost against the priciest one. Press a card for the subagent's page: each request as a bar split by token type, with the running total over them (hover a bar for its figures), its cost by token type, the tools it called, its task and its answer. With a subagent's transcript in view, the tab opens on that subagent's page
 - **Turns**: a stacked bar chart of each turn's cost, split into main thread and subagents or by token type; hover a bar for its breakdown, or press a turn for its details
 
 Prices are first-party list prices (cache writes at the 5-minute rate). "Other" is the `/cost` total minus what the mod itemizes: the WebSearch tool's own model call, 1-hour cache writes, fast mode, compaction, and spend from before the mod loaded.

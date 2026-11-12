@@ -69,7 +69,37 @@ export type AgentRow = {
   webSearches: number
   /** The main turn it first answered in. */
   turn: number
+  /** The model of its last response, and the effort that response asked for. */
+  model?: string
+  effort?: string
+  /** When its loop started and last ended, in `$.clock.now()` milliseconds. */
+  startedAt?: number
+  endedAt?: number
+  /** The prompt size of its last request: what its context held. */
+  contextTokens: number
+  /** Output tokens over the time they streamed, for its rate. */
+  outputMs: number
+  /** Each response, oldest first (at most 80). */
+  steps: AgentStep[]
+  /** Tool calls by tool name. */
+  tools: Record<string, number>
+  /** The task it was given, and the start of its last answer. */
+  prompt?: string
+  answer?: string
+  isAborted?: boolean
 }
+
+/** One model response in a subagent's loop. */
+export type AgentStep = Tokens & {
+  model: string
+  /** When it ended, and how long it streamed. */
+  at: number
+  ms: number
+  usd: number
+}
+
+/** Which agents group the Agents tab folds. */
+export type AgentGroup = 'running' | 'finished'
 
 export type Tab = 'summary' | 'models' | 'agents' | 'turns'
 
@@ -117,6 +147,15 @@ declare module 'claude-code' {
       selectedTurn: number | null
       /** The clock the band redraws by, ticked every second. */
       now: number
+      /**
+       * The subagent whose page the Agents tab shows: an id, `''` for the list the
+       * person went back to, null to follow the transcript in view.
+       */
+      selectedAgent: string | null
+      /** Folded agent groups. */
+      folded: Partial<Record<AgentGroup, boolean>>
+      /** When the session started, in `$.clock.now()` milliseconds. */
+      startedAt: number | null
     }
   }
 }
