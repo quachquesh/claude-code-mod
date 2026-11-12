@@ -1,0 +1,12 @@
+{
+  "name": "claude-code-mod",
+  "owner": { "name": "quachquesh" },
+  "description": "Mods for Claude Code by quachquesh",
+  "plugins": [
+    {
+      "name": "session-cost",
+      "source": "./session-cost",
+      "description": "Live session cost: turn, cost, context, cache countdown and tok/s above the prompt, and a pane with cost by token type, model, subagent and turn"
+    }
+  ]
+}
