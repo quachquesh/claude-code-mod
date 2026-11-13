@@ -202,6 +202,19 @@ const clock = (ms: number) => {
   return `${two(d.getHours())}:${two(d.getMinutes())}:${two(d.getSeconds())}`
 }
 
+/** 63s -> "01:03", 3600s -> "60:00": five cells wide, so a ticking figure never shifts the row. */
+const mmss = (ms: number) => {
+  const s = Math.max(0, Math.floor(ms / 1000))
+  return `${two(Math.floor(s / 60))}:${two(s % 60)}`
+}
+
+/** Cells a string takes on the row: emoji draw two, the rest one. */
+const cells = (s: string) => {
+  let n = 0
+  for (const ch of s) n += /[⌚⌛⏩-⏳⚡\u{1F300}-\u{1FAFF}]/u.test(ch) ? 2 : 1
+  return n
+}
+
 
 
 // ---------------------------------------------------------------------------
@@ -1032,6 +1045,9 @@ export const register: Register = on => {
     const cacheColor =
       cacheLeft === null ? undefined : cacheLeft <= 0 ? 'red' : cacheLeft < 60_000 ? 'yellow' : 'green'
     const money = (n: number | null) => (n === null ? '—' : usd(n))
+    // Figures that tick are set to a fixed width, so the groups after them stay put.
+    const timer = elapsed === null ? '--:--' : mmss(elapsed)
+    const tpsText = (tps === null ? '—' : String(Math.round(tps))).padStart(3)
 
     // The context window's fill, as the status line has it: a short bar and its percent.
     const ctx = (await read($, contextFill)) ?? { tokens: null, window: 0, percent: null }
@@ -1046,23 +1062,24 @@ export const register: Register = on => {
     // `text` measures the group (an emoji takes two cells), `keep` says how readily it
     // goes when the row is short.
     type Chip = { text: string; keep: number; node: ReturnType<typeof Text> | ReturnType<typeof Box> }
-    const cacheValue = cacheLeft === null ? '—' : cacheLeft <= 0 ? 'expired' : dur(cacheLeft)
+    // The cache's countdown is always mm:ss (60:00 down to 00:00), five cells.
+    const cacheValue = cacheLeft === null ? '--:--' : cacheLeft <= 0 ? '00:00' : mmss(cacheLeft)
     const chips: Chip[] = [
       {
         // The current turn: running or idle, and for how long.
-        text: `● #${turnNo} ${elapsed === null ? '' : dur(elapsed)}`,
+        text: `● #${turnNo} ${timer}`,
         keep: 98,
         node: (
           <Text>
             <Text color={lv.isRunning ? 'green' : 'gray'}>{lv.isRunning ? '●' : '○'}</Text>
             <Text bold>{` #${turnNo}`}</Text>
-            <Text dimColor>{elapsed === null ? '' : ` ${dur(elapsed)}`}</Text>
+            <Text dimColor>{` ${timer}`}</Text>
           </Text>
         ),
       },
       {
         // Cost, one group: this turn (yellow) | the session as /cost totals it (green).
-        text: `💰  ${money(turnUsd)} | ${money(value)}`,
+        text: `💰 ${money(turnUsd)} | ${money(value)}`,
         keep: 99,
         node: (
           <Text>
@@ -1075,7 +1092,7 @@ export const register: Register = on => {
       },
       {
         // The context window: how full it is.
-        text: `🧠  ${'━'.repeat(CTX_BAR)} ${ctxLabel}`,
+        text: `🧠 ${'━'.repeat(CTX_BAR)} ${ctxLabel}`,
         keep: 90,
         node: Svg ? (
           // A desktop draws a rounded pill; a terminal a thin line in two tones.
@@ -1095,8 +1112,9 @@ export const register: Register = on => {
       },
       {
         // The prompt cache: time left before the main thread's cache lapses.
-        text: `⏳  ${cacheValue}`,
-        keep: 80,
+        text: `⏳ ${cacheValue}`,
+        // Kept ahead of the speed and the context bar: it is the last to go but the time and the turn.
+        keep: 95,
         node: (
           <Text>
             <Text>{cacheLeft !== null && cacheLeft <= 0 ? '⌛ ' : '⏳ '}</Text>
@@ -1108,13 +1126,13 @@ export const register: Register = on => {
       },
       {
         // Speed: live while a response streams, the last response's rate otherwise.
-        text: `⚡  ${tps === null ? '—' : Math.round(tps)}/s`,
-        keep: 85,
+        text: `⚡ ${tpsText}/s`,
+        keep: 70,
         node: (
           <Text>
             <Text>⚡ </Text>
             <Text color="cyan" bold={lv.streamingSince !== null}>
-              {tps === null ? '—' : String(Math.round(tps))}
+              {tpsText}
             </Text>
             <Text dimColor>/s</Text>
           </Text>
@@ -1122,7 +1140,7 @@ export const register: Register = on => {
       },
       {
         // Wall-clock time: always shown, however narrow the row.
-        text: `🕒  ${clock(t)}`,
+        text: `🕒 ${clock(t)}`,
         keep: Infinity,
         node: (
           <Text>
@@ -1134,12 +1152,14 @@ export const register: Register = on => {
     ]
 
     // Fit the row beside the button: drop the least needed groups first; the time stays.
-    // Two cells between groups: apart enough to read as groups, close enough to scan.
-    const GAP = '  '
+    // One cell between groups: each opens with its icon, which is enough to tell them apart.
+    // The row's width is counted in cells (an emoji takes two); the button is `[📊]` and
+    // its two cells of margin.
+    const GAP = ' '
     const room = e.props.bodyColumns - 6
     const kept = [...chips]
     const width = (list: Chip[]) =>
-      list.reduce((a, c) => a + c.text.length, 0) + Math.max(0, list.length - 1) * GAP.length
+      list.reduce((a, c) => a + cells(c.text), 0) + Math.max(0, list.length - 1) * GAP.length
     while (width(kept) > room) {
       const droppable = kept.filter(c => c.keep !== Infinity)
       if (droppable.length <= 1) break

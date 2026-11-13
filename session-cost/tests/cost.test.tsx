@@ -228,15 +228,50 @@ test('the band shows the live figures, the context fill, and opens the pane', as
   expect(statuses.every(s => s === undefined)).toBe(true)
 })
 
-test('the cache countdown turns to expired', async ($, on) => {
+test('the cache countdown turns to an hourglass at 00:00', async ($, on) => {
   const clk = engine(on)
   await play($)
   await clk.advance(61 * 60_000)
 
   const ui = await $.ui.mount({ ...BAND, surface: 'desktop' })
   const line = (await ui.findAll({ type: 'Text' })).map(t => t.text).join('\n')
-  expect(line).toContain('expired')
+  expect(line).toContain('⌛ 00:00')
   await ui.unmount()
+})
+
+test('the band keeps its width as the timers tick', async ($, on) => {
+  const clk = engine(on)
+  await play($)
+
+  const lengths: number[] = []
+  for (const wait of [5_000, 8 * 60_000, 50 * 60_000, 10 * 60_000]) {
+    await clk.advance(wait)
+    const ui = await $.ui.mount({ ...BAND, surface: 'desktop' })
+    const line = (await ui.findAll({ type: 'Text' })).map(t => t.text).join('\n')
+    // Countdown at 59:55, 51:55, 01:55 and then past zero; the figures keep five cells.
+    expect(line).toMatch(/\d\d:\d\d/)
+    lengths.push(line.replace(/\d{2}:\d{2}:\d{2}/, '').length)
+    await ui.unmount()
+  }
+  expect(new Set(lengths).size).toBe(1)
+})
+
+test('when the row is short the cache countdown outlasts the speed and the context bar', async ($, on) => {
+  const clk = engine(on)
+  await play($)
+  await clk.advance(10_000)
+
+  let sawSpeedGone = false
+  for (let bodyColumns = 120; bodyColumns >= 24; bodyColumns -= 2) {
+    const ui = await $.ui.mount({ ...BAND, props: { ...BAND.props, bodyColumns }, surface: 'desktop' })
+    const line = (await ui.findAll({ type: 'Text' })).map(t => t.text).join('\n')
+    const has = (icon: string) => line.includes(icon)
+    if (has('⚡')) expect(has('⏳')).toBe(true)
+    if (has('🧠')) expect(has('⏳')).toBe(true)
+    if (!has('⚡')) sawSpeedGone = true
+    await ui.unmount()
+  }
+  expect(sawSpeedGone).toBe(true)
 })
 
 test('the band leads with the turn, drops the words, and always keeps the time', async ($, on) => {
