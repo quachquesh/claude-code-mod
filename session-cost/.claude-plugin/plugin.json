@@ -1,7 +1,7 @@
 {
   "name": "session-cost",
-  "version": "0.3.1",
-  "description": "Live session cost for Claude Code: a one-row band above the prompt (turn, cost, context, prompt cache countdown, tok/s, time) and a pane with cost by token type, model, subagent and turn, and a page for each subagent",
+  "version": "0.4.0",
+  "description": "Live session cost for Claude Code: a one-row band above the prompt (turn, cost, context, prompt cache countdown, tok/s, time) and a pane with cost by token type, model, subagent and turn, a page for each subagent, and this machine's share of the plan's 5-hour and weekly windows",
   "author": { "name": "quachquesh" },
   "types": "./types/index.d.ts"
 }

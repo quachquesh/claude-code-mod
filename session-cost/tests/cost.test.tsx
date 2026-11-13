@@ -613,3 +613,61 @@ test('the Usage tab shows a window that has reset as waiting for the next respon
   expect((await texts(ui)).join('\n')).toContain('reset, waiting for the next response')
   await ui.unmount()
 })
+
+// ---------------------------------------------------------------------------
+// The band's plan-usage group.
+// ---------------------------------------------------------------------------
+const bandLines = async ($: Engine, bodyColumns = 140) => {
+  const ui = await $.ui.mount({ ...BAND, props: { ...BAND.props, bodyColumns }, surface: 'desktop' })
+  const lines = await texts(ui)
+  await ui.unmount()
+  return lines
+}
+
+test('the band shows the account figures of both windows', async ($, on) => {
+  const clk = engine(on)
+  watch(on)
+  await startSession($)
+  await respond($, clk, 34, 12)
+
+  const lines = await bandLines($)
+  expect(lines).toContain('5h  34% 7d  12%')
+  expect(lines.join('\n')).toContain('📈')
+})
+
+test('the band has no usage group before a reading', async ($, on) => {
+  const clk = engine(on)
+  watch(on)
+  await startSession($)
+  await clk.advance(1_000)
+
+  expect((await bandLines($)).join('\n')).not.toContain('📈')
+})
+
+test('the usage group keeps its width from 5% to 100%', async ($, on) => {
+  const clk = engine(on)
+  watch(on)
+  await startSession($)
+  await respond($, clk, 5, 5)
+  const small = (await bandLines($)).find(x => x.startsWith('5h'))
+  await respond($, clk, 100, 100)
+  const full = (await bandLines($)).find(x => x.startsWith('5h'))
+
+  expect(small).toBeDefined()
+  expect(small?.length).toBe(full?.length)
+})
+
+test('when the row is short the usage group goes before the speed does', async ($, on) => {
+  const clk = engine(on)
+  watch(on)
+  await startSession($)
+  await respond($, clk, 34, 12)
+
+  let sawGone = false
+  for (let bodyColumns = 130; bodyColumns >= 24; bodyColumns -= 2) {
+    const line = (await bandLines($, bodyColumns)).join('\n')
+    if (line.includes('📈')) expect(line.includes('⚡')).toBe(true)
+    if (!line.includes('📈')) sawGone = true
+  }
+  expect(sawGone).toBe(true)
+})

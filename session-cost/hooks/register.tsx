@@ -1194,6 +1194,20 @@ export const register: Register = on => {
     // `text` measures the group (an emoji takes two cells), `keep` says how readily it
     // goes when the row is short.
     type Chip = { text: string; keep: number; node: ReturnType<typeof Text> | ReturnType<typeof Box> }
+    // The plan's windows as the account reports them, four cells a figure so it never shifts.
+    // A window whose reset has passed has no figure until the next response reads it again.
+    const plan = await read($, usage)
+    const livePct = (k: RateKind) => {
+      const r = plan.readings[k]
+      return r !== undefined && Date.parse(r.resetsAt) > t ? r.percent : null
+    }
+    const planFig = (k: RateKind) => {
+      const p = livePct(k)
+      return p === null ? '  --' : `${String(Math.round(p)).padStart(3)}%`
+    }
+    const planTop = Math.max(...KINDS.map(k => livePct(k) ?? 0))
+    const planText = `5h ${planFig('five_hour')} 7d ${planFig('seven_day')}`
+    const planColor = planTop >= 90 ? 'red' : planTop >= 70 ? 'yellow' : undefined
     // The cache's countdown is always mm:ss (60:00 down to 00:00), five cells.
     const cacheValue = cacheLeft === null ? '--:--' : cacheLeft <= 0 ? '00:00' : mmss(cacheLeft)
     const chips: Chip[] = [
@@ -1270,6 +1284,21 @@ export const register: Register = on => {
           </Text>
         ),
       },
+      ...(KINDS.some(k => livePct(k) !== null)
+        ? [
+            {
+              // The account's use of the 5-hour and weekly windows; the first group to go.
+              text: `📈 ${planText}`,
+              keep: 60,
+              node: (
+                <Text>
+                  <Text>📈 </Text>
+                  <Text color={planColor}>{planText}</Text>
+                </Text>
+              ),
+            },
+          ]
+        : []),
       {
         // Wall-clock time: always shown, however narrow the row.
         text: `🕒 ${clock(t)}`,
