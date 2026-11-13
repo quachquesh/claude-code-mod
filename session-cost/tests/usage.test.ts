@@ -6,6 +6,7 @@ import {
   factor,
   hourBars,
   learn,
+  mergeSpend,
   pruneSpend,
   qualifies,
   share,
@@ -104,4 +105,8 @@ test('dayBars returns one bar per local calendar date inside [from, now]', () =>
     { start: new Date(2026, 10, 12).getTime(), usd: 1 },
     { start: new Date(2026, 10, 13).getTime(), usd: 2 },
   ])
+})
+
+test('mergeSpend adds two sets of buckets minute by minute', () => {
+  expect(mergeSpend({ a: 1, b: 2 }, { b: 3, c: 4 })).toEqual({ a: 1, b: 5, c: 4 })
 })

@@ -559,3 +559,57 @@ test('a store that fails does not stop the recording', async ($, on) => {
 
   expect(Math.abs(total(seen.usage?.spend ?? {}) - 0.6) < 1e-9).toBe(true)
 })
+
+/** The pane's Usage tab, after `responses` responses of $0.60 that moved the windows. */
+const usageTab = async ($: Engine, on: On, responses: number) => {
+  const clk = engine(on)
+  watch(on)
+  await startSession($)
+  for (let i = 0; i < responses; i++) await respond($, clk, 10 + 0.5 * i, 2 + 0.2 * i)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: 'tab-usage' })
+  return { ui, lines: await texts(ui) }
+}
+
+test("the Usage tab shows this machine's share of each window, by hour and by day", async ($, on) => {
+  const { ui, lines } = await usageTab($, on, 9)
+  const line = lines.join('\n')
+  // $5.40 spent; 0.5 account points per $0.60 in the 5h window (0.2 in the week).
+  expect(line).toContain('~4.5%') // 5h window: 5.4 x 0.5/0.6
+  expect(line).toContain('~1.8%') // week: 5.4 x 0.2/0.6
+  expect(line).toContain('$5.40')
+  expect(line).toContain('14.0%') // the account's own reading of the 5h window
+  expect(line).toContain('2h 58m') // time to the reset
+  for (const h of ['+0h', '+1h', '+2h', '+3h', '+4h']) expect(lines).toContain(h)
+  // The week began 2026-11-05 23:30 local: eight calendar dates up to the 12th.
+  expect(lines.filter(x => /^(Sun|Mon|Tue|Wed|Thu|Fri|Sat) \d{1,2}$/.test(x))).toHaveLength(8)
+  expect(lines).toContain('Thu 12')
+  await ui.unmount()
+})
+
+test('the Usage tab says it is calibrating until enough pairs are seen', async ($, on) => {
+  const { ui, lines } = await usageTab($, on, 3)
+  const line = lines.join('\n')
+  expect(line).toContain('calibrating')
+  expect(line).toContain('$1.80')
+  expect(line).not.toContain('~')
+  await ui.unmount()
+})
+
+test('the Usage tab with no subscription reading says so', async ($, on) => {
+  const { ui, lines } = await usageTab($, on, 0)
+  expect(lines.join('\n')).toContain('No subscription usage reported yet')
+  await ui.unmount()
+})
+
+test('the Usage tab shows a window that has reset as waiting for the next response', async ($, on) => {
+  const clk = engine(on)
+  watch(on)
+  await startSession($)
+  await respond($, clk, 10, 2, new Date(START + 30_000).toISOString())
+  await clk.advance(60_000) // past that reset
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: 'tab-usage' })
+  expect((await texts(ui)).join('\n')).toContain('reset, waiting for the next response')
+  await ui.unmount()
+})

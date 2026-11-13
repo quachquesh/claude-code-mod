@@ -48,6 +48,13 @@ export const spendBetween = (spend: Record<string, number>, from: number, to: nu
   return total
 }
 
+/** Two sets of buckets as one, minute by minute. */
+export const mergeSpend = (a: Record<string, number>, b: Record<string, number>): Record<string, number> => {
+  const out = { ...a }
+  for (const [key, usd] of Object.entries(b)) out[key] = (out[key] ?? 0) + usd
+  return out
+}
+
 /** Whether `next` and the reading before it make a calibration pair. */
 export const qualifies = (prev: Reading | undefined, next: Reading): boolean =>
   prev !== undefined &&

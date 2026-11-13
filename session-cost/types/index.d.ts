@@ -101,7 +101,7 @@ export type AgentStep = Tokens & {
 /** Which agents group the Agents tab folds. */
 export type AgentGroup = 'running' | 'finished'
 
-export type Tab = 'summary' | 'models' | 'agents' | 'turns'
+export type Tab = 'summary' | 'models' | 'agents' | 'turns' | 'usage'
 
 /** What the turns chart stacks: who spent it, or which tokens. */
 export type ChartMode = 'source' | 'category'

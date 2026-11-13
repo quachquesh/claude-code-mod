@@ -19,7 +19,19 @@ import type {
   TurnRow,
   UsageLedger,
 } from '../types'
-import { addSpend, learn, pruneSpend, qualifies } from './usage'
+import {
+  addSpend,
+  dayBars,
+  factor,
+  hourBars,
+  learn,
+  mergeSpend,
+  pruneSpend,
+  qualifies,
+  share,
+  spendBetween,
+  windowStart,
+} from './usage'
 
 const PANE = 'session-cost'
 const TITLE = 'Session cost'
@@ -1443,6 +1455,7 @@ export const register: Register = on => {
             ['models', 'Models', '2'],
             ['agents', agentCount > 0 ? `Agents ${runningCount > 0 ? `●${runningCount}` : agentCount}` : 'Agents', '3'],
             ['turns', 'Turns', '4'],
+            ['usage', 'Usage', '5'],
           ] as const
         ).map(([id, label, hotkey]) => (
           <Button
@@ -1455,6 +1468,8 @@ export const register: Register = on => {
               await update($, tab, () => id)
               // Back to the Agents tab: the list, or the agent whose transcript is in view.
               if (id === 'agents') await update($, selectedAgent, () => null)
+              // The other sessions on this machine may have spent since this one last looked.
+              if (id === 'usage') await loadUsage($)
             }}
           />
         ))}
@@ -1929,6 +1944,110 @@ export const register: Register = on => {
       </Box>
     )
 
+    // --- Usage: this machine's share of the plan's windows ----------------------
+    const ul = await read($, usage)
+    const pooled = mergeSpend(ul.others, ul.spend)
+    const WEEKDAY = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat']
+    const MINE = '#5B8DEF'
+    const REST = '#9AA0A6'
+    const FREE = '#4a4d52'
+    /** 8940000 ms -> "2h 29m"; a day or more -> "6d 4h". */
+    const span = (ms: number) => {
+      const m = Math.max(0, Math.floor(ms / 60_000))
+      const d = Math.floor(m / 1440)
+      const h = Math.floor((m % 1440) / 60)
+      return d > 0 ? `${d}d ${h}h` : `${h}h ${two(m % 60)}m`
+    }
+    const windowView = (kind: RateKind, title: string) => {
+      const r = ul.readings[kind]
+      if (!r) return null
+      const resetAt = Date.parse(r.resetsAt)
+      if (!(resetAt > t)) return <Heading text={title} hint="reset, waiting for the next response" />
+      const start = windowStart(kind, r.resetsAt)
+      const spent = spendBetween(pooled, start, t + 60_000)
+      const calibration = ul.calibration[kind]
+      const k = factor(calibration)
+      const mine = share(spent, k, r.percent)
+      const bars =
+        kind === 'five_hour'
+          ? hourBars(pooled, start, t).map((v, i) => ({ label: `+${i}h`, usd: v }))
+          : dayBars(pooled, start, t).map(d => {
+              const day = new Date(d.start)
+              return { label: `${WEEKDAY[day.getDay()] ?? ''} ${day.getDate()}`, usd: d.usd }
+            })
+      const top = Math.max(...bars.map(b => b.usd), 1e-9)
+      const W_BARLABEL = 7
+      const W_BARVALUE = 18
+      const barCells = Math.max(6, cols - W_BARLABEL - W_BARVALUE)
+      return (
+        <Box flexDirection="column">
+          <Heading text={title} hint={`resets in ${span(resetAt - t)}`} />
+          <Split
+            cells={Math.max(8, cols - 2)}
+            parts={[
+              { value: mine ?? 0, color: MINE },
+              { value: Math.max(0, r.percent - (mine ?? 0)), color: REST },
+              { value: Math.max(0, 100 - r.percent), color: FREE },
+            ]}
+            alt={`Account ${r.percent.toFixed(1)}% used`}
+          />
+          <Row label="Account" cost={`${r.percent.toFixed(1)}%`} />
+          <Row label="This machine" tokens={usd(spent)} cost={mine === null ? '—' : `~${mine.toFixed(1)}%`} bold />
+          {mine === null && (
+            <Text dimColor>
+              {calibration.n < 8
+                ? `calibrating: ${calibration.n} of 8 pairs seen`
+                : 'calibrating: the window has barely moved yet'}
+            </Text>
+          )}
+          {bars.map(b => {
+            const part = share(b.usd, k, r.percent)
+            return (
+              <Box flexDirection="row">
+                <Box width={W_BARLABEL}>
+                  <Text dimColor>{b.label}</Text>
+                </Box>
+                <Split
+                  cells={barCells}
+                  parts={[
+                    { value: b.usd, color: MINE },
+                    { value: top - b.usd, color: FREE },
+                  ]}
+                  alt={`${b.label} ${usd(b.usd)}`}
+                />
+                <Box width={W_BARVALUE} justifyContent="flex-end">
+                  <Text dimColor>{b.usd === 0 ? '' : part === null ? usd(b.usd) : `~${part.toFixed(1)}%  ${usd(b.usd)}`}</Text>
+                </Box>
+              </Box>
+            )
+          })}
+        </Box>
+      )
+    }
+    const fiveHour = windowView('five_hour', '5-hour window')
+    const sevenDay = windowView('seven_day', 'Week')
+    const usageView = (
+      <Box flexDirection="column">
+        {fiveHour === null && sevenDay === null && <Text dimColor>No subscription usage reported yet.</Text>}
+        {fiveHour}
+        {sevenDay}
+        {(fiveHour !== null || sevenDay !== null) && (
+          <Box flexDirection="column" marginTop={1}>
+            <Text>
+              <Text color={MINE}>■</Text>
+              <Text dimColor> this machine  </Text>
+              <Text color={REST}>■</Text>
+              <Text dimColor> the rest of the account</Text>
+            </Text>
+            <Text dimColor>
+              The machine's share is an estimate: its own spend at list price times the account points
+              per dollar learned from its back-to-back responses. The week runs from its reset, in local days.
+            </Text>
+          </Box>
+        )}
+      </Box>
+    )
+
     return (
       <Box flexDirection="column">
         {header}
@@ -1938,6 +2057,7 @@ export const register: Register = on => {
         {current === 'models' && modelsView}
         {current === 'agents' && (page ? agentPage(page) : agentsList)}
         {current === 'turns' && turnsView}
+        {current === 'usage' && usageView}
         <Text> </Text>
         <Text dimColor>
           List prices, cache writes at the 5-minute rate. "Other" is the /cost total minus the lines
