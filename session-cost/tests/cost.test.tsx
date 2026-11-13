@@ -596,8 +596,10 @@ test("the Usage tab shows this machine's share of each window, by hour and by da
   expect(line).toContain('2h 58m') // time to the reset
   for (const h of ['+0h', '+1h', '+2h', '+3h', '+4h']) expect(lines).toContain(h)
   // The week began 2026-11-05 23:30 local: eight calendar dates up to the 12th.
-  expect(lines.filter(x => /^(Sun|Mon|Tue|Wed|Thu|Fri|Sat) \d{1,2}$/.test(x))).toHaveLength(8)
-  expect(lines).toContain('Thu 12')
+  expect(lines.filter(x => /^(Sun|Mon|Tue|Wed|Thu|Fri|Sat) \d{1,2}·?$/.test(x))).toHaveLength(8)
+  expect(lines).toContain('Thu 12·') // today is a partial date
+  expect(lines).toContain('Thu 5·') // so is the day the week began on
+  expect(lines).toContain('Fri 6') // a whole one
   await ui.unmount()
 })
 
@@ -737,4 +739,74 @@ test('a pair whose response cost nothing is not learned from', async ($, on) => 
   await respond($, clk, 11, 2.2, RESET_A, 'claude-unknown-1')
 
   expect(seen.usage?.calibration.five_hour.n).toBe(0)
+})
+
+// ---------------------------------------------------------------------------
+// The review's minor findings, fixed.
+// ---------------------------------------------------------------------------
+test('stored calibration with negative or absurd figures is ignored', async ($, on) => {
+  const clk = engine(on)
+  const junk = { dPct: -5, usd: 1, n: 1_000_000_000 }
+  const seen = watch(on, { calibration: { five_hour: junk, seven_day: junk } })
+  await startSession($)
+  await respond($, clk, 10, 2)
+  await $.turn.complete({ turnId: 't1', answer: '', durationMs: 1, isAborted: false, reason: 'completed' } as never)
+
+  expect((seen.stored.calibration as { five_hour: { n: number } }).five_hour.n).toBe(0)
+})
+
+test('the hourly estimates add up to no more than the account figure', async ($, on) => {
+  const clk = engine(on)
+  const minute = String(Math.floor(START / 60_000))
+  // Another session spent $100 in the same minutes: the estimate would pass the account's 14.0%.
+  const hourBefore = String(Number(minute) - 60)
+  watch(on, { 'usage-earlier': { spend: { [minute]: 100, [hourBefore]: 100 }, at: START } })
+  await startSession($)
+  for (let i = 0; i < 9; i++) await respond($, clk, 10 + 0.5 * i, 2 + 0.2 * i)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: 'tab-usage' })
+  const lines = await texts(ui)
+  const first = lines.indexOf('5-hour window')
+  const second = lines.indexOf('Week')
+  const hourRows = lines.slice(first, second).filter(x => /^~[\d.]+%  \$/.test(x))
+  const sum = hourRows.reduce((a, x) => a + Number(/^~([\d.]+)%/.exec(x)?.[1] ?? 0), 0)
+  expect(hourRows.length).toBeGreaterThan(0)
+  expect(sum <= 14.0 + 0.1 * hourRows.length).toBe(true)
+  expect(lines.slice(first, second)).toContain('~14.0%') // the machine's whole, clamped
+  await ui.unmount()
+})
+
+test('after the account stops reporting windows the tab says there is no subscription usage', async ($, on) => {
+  const clk = engine(on)
+  watch(on)
+  await startSession($)
+  await respond($, clk, 10, 2, new Date(START + 30_000).toISOString())
+  await clk.advance(60_000) // that window has reset
+  limits = []
+  await step($, 't1', 'claude-haiku-5-5')
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: 'tab-usage' })
+  expect((await texts(ui)).join('\n')).toContain('No subscription usage reported yet')
+  await ui.unmount()
+})
+
+test('with one window reset and the other live, each shows what it has', async ($, on) => {
+  const clk = engine(on)
+  watch(on)
+  await startSession($)
+  limits = [
+    { kind: 'five_hour', percentUsed: 30, resetsAt: new Date(START + 30_000).toISOString() },
+    { kind: 'seven_day', percentUsed: 12, resetsAt: RESET_A },
+  ]
+  await step($, 't1', 'claude-haiku-5-5')
+  await clk.advance(60_000)
+
+  const band = (await bandLines($)).join('\n')
+  expect(band).toContain('5h   -- 7d  12%')
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: 'tab-usage' })
+  const lines = (await texts(ui)).join('\n')
+  expect(lines).toContain('reset, waiting for the next response')
+  expect(lines).toContain('12.0%')
+  await ui.unmount()
 })

@@ -703,8 +703,9 @@ const storedSpend = (v: unknown): Record<string, number> =>
 
 const storedCalibration = (v: unknown): Record<RateKind, Calibration> | null => {
   if (!isRecord(v)) return null
+  // Sums are never negative, and a million pairs is more than any session makes.
   const one = (c: unknown): Calibration | null =>
-    isRecord(c) && [c.dPct, c.usd, c.n].every(x => typeof x === 'number' && Number.isFinite(x))
+    isRecord(c) && [c.dPct, c.usd, c.n].every(x => typeof x === 'number' && Number.isFinite(x) && x >= 0) && (c.n as number) <= 1_000_000
       ? { dPct: c.dPct as number, usd: c.usd as number, n: c.n as number }
       : null
   const five = one(v.five_hour)
@@ -782,7 +783,8 @@ async function loadUsage($: EngineInterface) {
 async function recordResponse($: EngineInterface, cost: number) {
   const at = await $.clock.now()
   const readings: Partial<Record<RateKind, Reading>> = {}
-  for (const r of (await $.session.usage()).rateLimits) {
+  const reported = (await $.session.usage()).rateLimits
+  for (const r of reported) {
     if ((r.kind === 'five_hour' || r.kind === 'seven_day') && r.resetsAt !== undefined) {
       readings[r.kind] = { percent: r.percentUsed, resetsAt: r.resetsAt, at }
     }
@@ -797,7 +799,13 @@ async function recordResponse($: EngineInterface, cost: number) {
         calibration = { ...calibration, [kind]: learn(calibration[kind], next.percent - prev.percent, cost) }
       }
     }
-    return { ...l, spend: addSpend(l.spend, at, cost), readings: { ...l.readings, ...readings }, calibration }
+    // An account reporting no windows at all has left the subscription: the old readings go.
+    return {
+      ...l,
+      spend: addSpend(l.spend, at, cost),
+      readings: reported.length === 0 ? {} : { ...l.readings, ...readings },
+      calibration,
+    }
   })
   await saveUsage($)
 }
@@ -2022,7 +2030,7 @@ export const register: Register = on => {
           ? hourBars(pooled, start, t).map((v, i) => ({ label: `+${i}h`, usd: v }))
           : dayBars(pooled, start, t).map(d => {
               const day = new Date(d.start)
-              return { label: `${WEEKDAY[day.getDay()] ?? ''} ${day.getDate()}`, usd: d.usd }
+              return { label: `${WEEKDAY[day.getDay()] ?? ''} ${day.getDate()}${d.partial ? '·' : ''}`, usd: d.usd }
             })
       const top = Math.max(...bars.map(b => b.usd), 1e-9)
       const W_BARLABEL = 7
@@ -2050,9 +2058,10 @@ export const register: Register = on => {
             </Text>
           )}
           {bars.map(b => {
-            const part = share(b.usd, k, r.percent)
+            // Each bar's share of the machine's whole, so the bars add up to it and to no more.
+            const part = mine === null || spent <= 0 ? null : b.usd * (mine / spent)
             return (
-              <Box flexDirection="row">
+              <Box key={`bar-${kind}-${b.label}`} flexDirection="row">
                 <Box width={W_BARLABEL}>
                   <Text dimColor>{b.label}</Text>
                 </Box>
@@ -2090,7 +2099,7 @@ export const register: Register = on => {
             </Text>
             <Text dimColor>
               The machine's share is an estimate: its own spend at list price times the account points
-              per dollar learned from its back-to-back responses. The week runs from its reset, in local days.
+              per dollar learned from its back-to-back responses. The week runs from its reset, in local days; a · marks a partial day.
             </Text>
           </Box>
         )}

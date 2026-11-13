@@ -84,13 +84,13 @@ export const hourBars = (spend: Record<string, number>, from: number, now: numbe
     spendBetween(spend, from + i * HOUR, Math.min(from + (i + 1) * HOUR, now + MINUTE)),
   )
 
-/** Spend on each local calendar date from `from` to `now`, the first and last dates partial. */
+/** Spend on each local calendar date from `from` to `now`; the first and last dates are `partial`. */
 export const dayBars = (
   spend: Record<string, number>,
   from: number,
   now: number,
-): Array<{ start: number; usd: number }> => {
-  const out: Array<{ start: number; usd: number }> = []
+): Array<{ start: number; usd: number; partial: boolean }> => {
+  const out: Array<{ start: number; usd: number; partial: boolean }> = []
   const first = new Date(from)
   let day = new Date(first.getFullYear(), first.getMonth(), first.getDate())
   while (day.getTime() <= now && out.length < 9) {
@@ -98,6 +98,8 @@ export const dayBars = (
     out.push({
       start: day.getTime(),
       usd: spendBetween(spend, Math.max(day.getTime(), from), Math.min(next.getTime(), now + MINUTE)),
+      // The window began part-way into the first date, and the last date is still running.
+      partial: day.getTime() < from || next.getTime() > now,
     })
     day = next
   }

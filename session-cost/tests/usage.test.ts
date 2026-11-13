@@ -102,9 +102,21 @@ test('dayBars returns one bar per local calendar date inside [from, now]', () =>
   )
   const bars = dayBars(s, from, now)
   expect(bars).toEqual([
-    { start: new Date(2026, 10, 12).getTime(), usd: 1 },
-    { start: new Date(2026, 10, 13).getTime(), usd: 2 },
+    { start: new Date(2026, 10, 12).getTime(), usd: 1, partial: true },
+    { start: new Date(2026, 10, 13).getTime(), usd: 2, partial: true },
   ])
+})
+
+test('dayBars marks only the first and the last date as partial', () => {
+  const from = new Date(2026, 10, 12, 22, 0).getTime()
+  const now = new Date(2026, 10, 14, 2, 0).getTime()
+  expect(dayBars({}, from, now).map(d => d.partial)).toEqual([true, false, true])
+})
+
+test('dayBars counts a window that began at midnight as a whole first date', () => {
+  const from = new Date(2026, 10, 12, 0, 0).getTime()
+  const now = new Date(2026, 10, 13, 9, 0).getTime()
+  expect(dayBars({}, from, now).map(d => d.partial)).toEqual([false, true])
 })
 
 test('mergeSpend adds two sets of buckets minute by minute', () => {
