@@ -1,6 +1,8 @@
 import { expect, mock, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
 import type { On } from 'claude-code'
+import { factor } from '../hooks/usage'
+import type { UsageLedger } from '../types'
 
 const PANE = {
   plugin: 'session-cost',
@@ -31,15 +33,25 @@ const USAGE = {
     cache_read_input_tokens: 0,
     cache_creation_input_tokens: 0,
   },
+  // A model the mod has no price for.
+  'claude-unknown-1': {
+    input_tokens: 1_000,
+    output_tokens: 1_000,
+    cache_read_input_tokens: 0,
+    cache_creation_input_tokens: 0,
+  },
 } as const
 
 let engineTotal = 0
+/** The rate-limit windows the mocked engine reports; a test sets them. */
+let limits: Array<{ kind: string; percentUsed: number; resetsAt?: string }> = []
 
 /** The engine beneath the plugin, answering each event. */
 // 2026-11-12 20:30:00 local time (UTC+7 here).
 const START = new Date(2026, 10, 12, 20, 30, 0).getTime()
 
 const engine = (on: On, onOpen: () => void = () => {}, onStatus: (text: string | undefined) => void = () => {}) => {
+  limits = []
   const clk = mock.clock(on, { now: START })
   on('agent.list', () => ({
     value: [
@@ -70,7 +82,7 @@ const engine = (on: On, onOpen: () => void = () => {}, onStatus: (text: string |
           ? { breakdown: { totalTokens: 414_000, maxTokens: 600_000, rawMaxTokens: 600_000, percentage: 69 } as never }
           : {}),
       },
-      rateLimits: [],
+      rateLimits: limits as never,
       cost: { usd: engineTotal },
     },
   }))
@@ -439,4 +451,111 @@ test('the context bar is a rounded pill on a desktop, a thin line on a terminal'
   expect(line).toContain('━')
   expect(line).toContain('69%')
   await term.unmount()
+})
+
+// ---------------------------------------------------------------------------
+// Plan usage: spend per response, the factor learned from close pairs, the store.
+// ---------------------------------------------------------------------------
+/** What the mod wrote: its usage ledger (state), and a store in memory that the test can look into. */
+const watch = (on: On, seed: Record<string, unknown> = {}, failWrites = false) => {
+  const seen = { usage: undefined as UsageLedger | undefined, stored: { ...seed } as Record<string, unknown> }
+  on('store.get', (_, e) => ({ value: seen.stored[e.key] }))
+  on('store.keys', () => ({ value: Object.keys(seen.stored) }))
+  on('store.set', (_, e) => {
+    if (failWrites) throw new Error('disk full')
+    seen.stored[e.key] = e.value
+    return { value: undefined }
+  })
+  on('state.set', async (_, e, next) => {
+    const w = e as unknown as { plugin: string; key: string; value: unknown }
+    if (w.plugin === 'session-cost' && w.key === 'usage') seen.usage = (w.value as { value: UsageLedger }).value // a shaped value is stored as { shape, value }
+    return next(e)
+  })
+  return seen
+}
+const RESET_A = new Date(START + 3 * 3_600_000).toISOString()
+const RESET_B = new Date(START + 9 * 3_600_000).toISOString()
+const total = (o: Record<string, number>) => Object.values(o).reduce((a, b) => a + b, 0)
+
+const startSession = async ($: Engine) => {
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await $.turn.start({ turnId: 't1', text: 'x' })
+}
+
+/** One Haiku response ($0.60) with the account at these figures, then ten seconds. */
+const respond = async (
+  $: Engine,
+  clk: { advance: (ms: number) => Promise<void> },
+  five: number,
+  seven: number,
+  resetsAt = RESET_A,
+  model = 'claude-haiku-5-5',
+) => {
+  limits = [
+    { kind: 'five_hour', percentUsed: five, resetsAt },
+    { kind: 'seven_day', percentUsed: seven, resetsAt },
+  ]
+  await step($, 't1', model)
+  await clk.advance(10_000)
+}
+
+test('responses are recorded and the factor is learned from close pairs', async ($, on) => {
+  const clk = engine(on)
+  const seen = watch(on)
+  await startSession($)
+  for (let i = 0; i < 9; i++) await respond($, clk, 10 + 0.5 * i, 2 + 0.1 * i)
+
+  const l = seen.usage as UsageLedger
+  expect(Math.abs(total(l.spend) - 9 * 0.6) < 1e-9).toBe(true)
+  expect(l.calibration.five_hour.n).toBe(8)
+  const k = factor(l.calibration.five_hour)
+  expect(k !== null && Math.abs(k - 0.5 / 0.6) < 1e-9).toBe(true)
+  expect(l.readings.five_hour?.resetsAt).toBe(RESET_A)
+})
+
+test('a pair across two windows is not learned from', async ($, on) => {
+  const clk = engine(on)
+  const seen = watch(on)
+  await startSession($)
+  await respond($, clk, 10, 2, RESET_A)
+  await respond($, clk, 10.5, 2.1, RESET_A)
+  await respond($, clk, 1, 0.1, RESET_B) // the window rolled over: skipped
+  await respond($, clk, 1.4, 0.2, RESET_B)
+
+  expect(seen.usage?.calibration.five_hour.n).toBe(2)
+})
+
+test('a model with no price records zero spend, never NaN', async ($, on) => {
+  const clk = engine(on)
+  const seen = watch(on)
+  await startSession($)
+  await respond($, clk, 10, 2, RESET_A, 'claude-unknown-1')
+
+  const l = seen.usage as UsageLedger
+  expect(Object.values(l.spend).every(v => Number.isFinite(v))).toBe(true)
+  expect(total(l.spend)).toBe(0)
+})
+
+test('spend and calibration are stored, and other sessions are read back', async ($, on) => {
+  const clk = engine(on)
+  const minute = String(Math.floor(START / 60_000))
+  const seen = watch(on, { 'usage-earlier': { spend: { [minute]: 2 }, at: START } })
+  await startSession($)
+  expect(total(seen.usage?.others ?? {})).toBe(2)
+
+  await respond($, clk, 10, 2)
+  await $.turn.complete({ turnId: 't1', answer: '', durationMs: 1, isAborted: false, reason: 'completed' } as never)
+  const keys = Object.keys(seen.stored)
+  expect(keys.some(k => k.startsWith('usage-') && k !== 'usage-earlier')).toBe(true)
+  expect(keys).toContain('calibration')
+})
+
+test('a store that fails does not stop the recording', async ($, on) => {
+  const clk = engine(on)
+  const seen = watch(on, {}, true)
+  await startSession($)
+  await respond($, clk, 10, 2)
+  await $.turn.complete({ turnId: 't1', answer: '', durationMs: 1, isAborted: false, reason: 'completed' } as never)
+
+  expect(Math.abs(total(seen.usage?.spend ?? {}) - 0.6) < 1e-9).toBe(true)
 })

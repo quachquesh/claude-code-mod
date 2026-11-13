@@ -158,6 +158,8 @@ export type UsageLedger = {
 declare module 'claude-code' {
   interface PluginState {
     'session-cost': {
+      /** What this machine has spent against the plan's windows, and the factor learned from it. */
+      usage: Shaped<UsageLedger>
       ledger: Shaped<Ledger>
       total: number | null
       tab: Tab

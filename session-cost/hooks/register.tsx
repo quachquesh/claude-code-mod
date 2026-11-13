@@ -5,16 +5,21 @@ import type {
   AgentGroup,
   AgentRow,
   AgentStep,
+  Calibration,
   ChartMode,
   ContextFill,
   Ledger,
   Live,
   ModelRow,
+  RateKind,
+  Reading,
   Tab,
   Tokens,
   TurnAgentRow,
   TurnRow,
+  UsageLedger,
 } from '../types'
+import { addSpend, learn, pruneSpend, qualifies } from './usage'
 
 const PANE = 'session-cost'
 const TITLE = 'Session cost'
@@ -63,6 +68,20 @@ const MAX_STEPS = 80
 // The main thread's prompt cache is taken to live an hour after its last response.
 const CACHE_TTL_MS = 60 * 60_000
 const now = atom({ plugin: 'session-cost', key: 'now' } as const, 0)
+
+const KINDS: readonly RateKind[] = ['five_hour', 'seven_day']
+const NO_CALIBRATION: Calibration = { dPct: 0, usd: 0, n: 0 }
+const EMPTY_USAGE: UsageLedger = {
+  instance: '',
+  spend: {},
+  others: {},
+  readings: {},
+  calibration: { five_hour: NO_CALIBRATION, seven_day: NO_CALIBRATION },
+}
+// What this machine has spent against the plan's windows, and the factor learned from it.
+const usage = atom({ plugin: 'session-cost', key: 'usage' } as const, EMPTY_USAGE, { shape: 'usage-1' })
+/** The store is written at most this often, and when a turn ends. */
+const SAVE_EVERY_MS = 10_000
 
 // ---------------------------------------------------------------------------
 // Pricing: first-party list prices, USD per million tokens (cached 2026-11).
@@ -658,6 +677,99 @@ async function refreshContext($: EngineInterface) {
   await update($, contextFill, () => fill)
 }
 
+const isRecord = (v: unknown): v is Record<string, unknown> =>
+  typeof v === 'object' && v !== null && !Array.isArray(v)
+
+/** The spend a stored session record holds; junk reads as none. */
+const storedSpend = (v: unknown): Record<string, number> =>
+  !isRecord(v) || !isRecord(v.spend)
+    ? {}
+    : Object.fromEntries(
+        Object.entries(v.spend).filter((e): e is [string, number] => typeof e[1] === 'number' && Number.isFinite(e[1])),
+      )
+
+const storedCalibration = (v: unknown): Record<RateKind, Calibration> | null => {
+  if (!isRecord(v)) return null
+  const one = (c: unknown): Calibration | null =>
+    isRecord(c) && [c.dPct, c.usd, c.n].every(x => typeof x === 'number' && Number.isFinite(x))
+      ? { dPct: c.dPct as number, usd: c.usd as number, n: c.n as number }
+      : null
+  const five = one(v.five_hour)
+  const seven = one(v.seven_day)
+  return five && seven ? { five_hour: five, seven_day: seven } : null
+}
+
+let lastSave = 0
+
+/** Writes this session's spend and the calibration to the store; a failing store is no harm. */
+async function saveUsage($: EngineInterface, force = false) {
+  const t = await $.clock.now()
+  if (!force && t - lastSave < SAVE_EVERY_MS) return
+  lastSave = t
+  const l = await read($, usage)
+  if (l.instance === '') return
+  try {
+    await $.store.set(`usage-${l.instance}`, { spend: pruneSpend(l.spend, t), at: t })
+    await $.store.set('calibration', l.calibration)
+  } catch {
+    // The figures stay in memory; the next write tries again.
+  }
+}
+
+/** Names this session, and reads the other sessions' spend and the shared calibration. */
+async function loadUsage($: EngineInterface) {
+  const t = await $.clock.now()
+  const mine = (await read($, usage)).instance
+  const instance = mine !== '' ? mine : `${t.toString(36)}-${Math.random().toString(36).slice(2, 8)}`
+  let others: Record<string, number> = {}
+  let stored: Record<RateKind, Calibration> | null = null
+  try {
+    for (const key of await $.store.keys()) {
+      if (!key.startsWith('usage-') || key === `usage-${instance}`) continue
+      for (const [minute, usd] of Object.entries(storedSpend(await $.store.get(key)))) {
+        others = { ...others, [minute]: (others[minute] ?? 0) + usd }
+      }
+    }
+    stored = storedCalibration(await $.store.get('calibration'))
+  } catch {
+    // No store: this session's own figures are all there is.
+  }
+  await update($, usage, l => ({
+    ...l,
+    instance,
+    spend: pruneSpend(l.spend, t),
+    others: pruneSpend(others, t),
+    // Of what is stored and what this session holds, the one with more pairs behind it.
+    calibration: {
+      five_hour: stored && stored.five_hour.n > l.calibration.five_hour.n ? stored.five_hour : l.calibration.five_hour,
+      seven_day: stored && stored.seven_day.n > l.calibration.seven_day.n ? stored.seven_day : l.calibration.seven_day,
+    },
+  }))
+}
+
+/** A response cost `cost` dollars: book it, read the windows, and learn from a close pair. */
+async function recordResponse($: EngineInterface, cost: number) {
+  const at = await $.clock.now()
+  const readings: Partial<Record<RateKind, Reading>> = {}
+  for (const r of (await $.session.usage()).rateLimits) {
+    if ((r.kind === 'five_hour' || r.kind === 'seven_day') && r.resetsAt !== undefined) {
+      readings[r.kind] = { percent: r.percentUsed, resetsAt: r.resetsAt, at }
+    }
+  }
+  await update($, usage, l => {
+    let calibration = l.calibration
+    for (const kind of KINDS) {
+      const next = readings[kind]
+      const prev = l.readings[kind]
+      if (next && prev && qualifies(prev, next)) {
+        calibration = { ...calibration, [kind]: learn(calibration[kind], next.percent - prev.percent, cost) }
+      }
+    }
+    return { ...l, spend: addSpend(l.spend, at, cost), readings: { ...l.readings, ...readings }, calibration }
+  })
+  await saveUsage($)
+}
+
 async function tick($: EngineInterface) {
   const t = await $.clock.now()
   await update($, now, () => t)
@@ -698,6 +810,7 @@ export const register: Register = on => {
     $.ui.status(undefined)
     await refreshTotal($)
     await refreshContext($)
+    await loadUsage($)
     // The band's clock: the time, the turn's timer and the cache countdown move each second.
     ticker?.cancel()
     ticker = $.clock.every(1000, () => {
@@ -803,6 +916,8 @@ export const register: Register = on => {
           t.turnId === e.turnId ? { ...t, isOpen: false, totalAfter: after ?? t.totalAfter } : t,
         ),
       }))
+      await saveUsage($, true)
+      await loadUsage($)
     }
 
     return ran
@@ -858,6 +973,10 @@ export const register: Register = on => {
       }))
     }
     const u = r.usage
+    // What this response cost at list price; a model with no price costs nothing here.
+    const stepRow = u === null ? undefined : addUsage({}, u.model, u)[u.model]
+    const stepCost = stepRow ? costOf(stepRow) : null
+    const stepUsd = stepCost === null ? 0 : sumCost(stepCost)
     const agentId = e.agentId
     let meta: { type: string; description: string } | null = null
     if (agentId !== undefined && u !== null) {
@@ -942,6 +1061,7 @@ export const register: Register = on => {
         }
       })
     }
+    if (u !== null) await recordResponse($, stepUsd)
 
     return r
   })
