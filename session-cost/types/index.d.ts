@@ -133,6 +133,28 @@ export type ContextFill = {
   percent: number | null
 }
 
+/** The rate-limit windows the usage panel follows. */
+export type RateKind = 'five_hour' | 'seven_day'
+
+/** One reading of a window: the account's percent used, when it resets, and when it was read. */
+export type Reading = { percent: number; resetsAt: string; at: number }
+
+/** Decayed sums behind a factor: account points risen, dollars spent, pairs seen. */
+export type Calibration = { dPct: number; usd: number; n: number }
+
+/** What this machine knows of its own use of the plan. */
+export type UsageLedger = {
+  /** Names this session's key in the store. */
+  instance: string
+  /** This session's spend, minute (epoch minutes, as a string) to USD. */
+  spend: Record<string, number>
+  /** Other sessions' spend on this machine, same shape, read from the store. */
+  others: Record<string, number>
+  /** The latest reading of each window. */
+  readings: Partial<Record<RateKind, Reading>>
+  calibration: Record<RateKind, Calibration>
+}
+
 declare module 'claude-code' {
   interface PluginState {
     'session-cost': {
