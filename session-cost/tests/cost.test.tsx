@@ -458,9 +458,23 @@ test('the context bar is a rounded pill on a desktop, a thin line on a terminal'
 // ---------------------------------------------------------------------------
 /** What the mod wrote: its usage ledger (state), and a store in memory that the test can look into. */
 const watch = (on: On, seed: Record<string, unknown> = {}, failWrites = false) => {
-  const seen = { usage: undefined as UsageLedger | undefined, stored: { ...seed } as Record<string, unknown> }
-  on('store.get', (_, e) => ({ value: seen.stored[e.key] }))
-  on('store.keys', () => ({ value: Object.keys(seen.stored) }))
+  const seen = {
+    usage: undefined as UsageLedger | undefined,
+    stored: { ...seed } as Record<string, unknown>,
+    failReads: false,
+  }
+  on('store.get', (_, e) => {
+    if (seen.failReads) throw new Error('unreadable')
+    return { value: seen.stored[e.key] }
+  })
+  on('store.keys', () => {
+    if (seen.failReads) throw new Error('unreadable')
+    return { value: Object.keys(seen.stored) }
+  })
+  on('store.delete', (_, e) => {
+    delete seen.stored[e.key]
+    return { value: undefined }
+  })
   on('store.set', (_, e) => {
     if (failWrites) throw new Error('disk full')
     seen.stored[e.key] = e.value
@@ -670,4 +684,57 @@ test('when the row is short the usage group goes before the speed does', async (
     if (!line.includes('📈')) sawGone = true
   }
   expect(sawGone).toBe(true)
+})
+
+// ---------------------------------------------------------------------------
+// Fixes from the final review.
+// ---------------------------------------------------------------------------
+test('records of sessions older than 8 days are deleted from the store and not counted', async ($, on) => {
+  engine(on)
+  const minute = String(Math.floor(START / 60_000))
+  const seen = watch(on, {
+    'usage-old': { spend: { [minute]: 1 }, at: START - 9 * 86_400_000 },
+    'usage-recent': { spend: { [minute]: 2 }, at: START - 86_400_000 },
+  })
+  await startSession($)
+
+  expect(Object.keys(seen.stored)).not.toContain('usage-old')
+  expect(Object.keys(seen.stored)).toContain('usage-recent')
+  expect(total(seen.usage?.others ?? {})).toBe(2)
+})
+
+test('a store that cannot be read at the start gets no calibration written over it', async ($, on) => {
+  const clk = engine(on)
+  const seen = watch(on, { calibration: { five_hour: { dPct: 9, usd: 9, n: 20 }, seven_day: { dPct: 9, usd: 9, n: 20 } } })
+  seen.failReads = true
+  await startSession($)
+  await respond($, clk, 10, 2)
+  await $.turn.complete({ turnId: 't1', answer: '', durationMs: 1, isAborted: false, reason: 'completed' } as never)
+
+  expect((seen.stored.calibration as { five_hour: { n: number } }).five_hour.n).toBe(20)
+})
+
+test('a read that fails later keeps what the session already knew of the others', async ($, on) => {
+  const clk = engine(on)
+  const minute = String(Math.floor(START / 60_000))
+  const seen = watch(on, { 'usage-earlier': { spend: { [minute]: 2 }, at: START } })
+  await startSession($)
+  expect(total(seen.usage?.others ?? {})).toBe(2)
+
+  seen.failReads = true
+  await respond($, clk, 10, 2)
+  await $.turn.complete({ turnId: 't1', answer: '', durationMs: 1, isAborted: false, reason: 'completed' } as never)
+
+  expect(total(seen.usage?.others ?? {})).toBe(2)
+})
+
+test('a pair whose response cost nothing is not learned from', async ($, on) => {
+  const clk = engine(on)
+  const seen = watch(on)
+  await startSession($)
+  await respond($, clk, 10, 2)
+  await respond($, clk, 10.5, 2.1, RESET_A, 'claude-unknown-1')
+  await respond($, clk, 11, 2.2, RESET_A, 'claude-unknown-1')
+
+  expect(seen.usage?.calibration.five_hour.n).toBe(0)
 })

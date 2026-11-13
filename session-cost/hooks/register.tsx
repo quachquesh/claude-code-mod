@@ -20,6 +20,7 @@ import type {
   UsageLedger,
 } from '../types'
 import {
+  KEEP_MS,
   addSpend,
   dayBars,
   factor,
@@ -712,6 +713,8 @@ const storedCalibration = (v: unknown): Record<RateKind, Calibration> | null => 
 }
 
 let lastSave = 0
+/** A read of the store has succeeded in this load of the module. */
+let storeReadable = false
 
 /** Writes this session's spend and the calibration to the store; a failing store is no harm. */
 async function saveUsage($: EngineInterface, force = false) {
@@ -722,7 +725,8 @@ async function saveUsage($: EngineInterface, force = false) {
   if (l.instance === '') return
   try {
     await $.store.set(`usage-${l.instance}`, { spend: pruneSpend(l.spend, t), at: t })
-    await $.store.set('calibration', l.calibration)
+    // Never over what an unreadable store may hold: only once a read has succeeded.
+    if (storeReadable) await $.store.set('calibration', l.calibration)
   } catch {
     // The figures stay in memory; the next write tries again.
   }
@@ -733,24 +737,39 @@ async function loadUsage($: EngineInterface) {
   const t = await $.clock.now()
   const mine = (await read($, usage)).instance
   const instance = mine !== '' ? mine : `${t.toString(36)}-${Math.random().toString(36).slice(2, 8)}`
-  let others: Record<string, number> = {}
+  // null while the store has not been read: what the session knew stands.
+  let others: Record<string, number> | null = null
   let stored: Record<RateKind, Calibration> | null = null
+  const expired: string[] = []
   try {
+    let pooled: Record<string, number> = {}
     for (const key of await $.store.keys()) {
       if (!key.startsWith('usage-') || key === `usage-${instance}`) continue
-      for (const [minute, usd] of Object.entries(storedSpend(await $.store.get(key)))) {
-        others = { ...others, [minute]: (others[minute] ?? 0) + usd }
-      }
+      const record = await $.store.get(key)
+      const at = isRecord(record) && typeof record.at === 'number' ? record.at : 0
+      if (t - at > KEEP_MS) expired.push(key)
+      else pooled = mergeSpend(pooled, storedSpend(record))
     }
     stored = storedCalibration(await $.store.get('calibration'))
+    others = pooled
+    storeReadable = true
   } catch {
-    // No store: this session's own figures are all there is.
+    // No store, or an unreadable one: this session's own figures, and what it knew, stand.
   }
+  // A record of a session that ended more than a week ago holds nothing the windows still count.
+  for (const key of expired) {
+    try {
+      await $.store.delete(key)
+    } catch {
+      // Left for the next load.
+    }
+  }
+  const fresh = others
   await update($, usage, l => ({
     ...l,
     instance,
     spend: pruneSpend(l.spend, t),
-    others: pruneSpend(others, t),
+    others: fresh === null ? l.others : pruneSpend(fresh, t),
     // Of what is stored and what this session holds, the one with more pairs behind it.
     calibration: {
       five_hour: stored && stored.five_hour.n > l.calibration.five_hour.n ? stored.five_hour : l.calibration.five_hour,
@@ -773,7 +792,8 @@ async function recordResponse($: EngineInterface, cost: number) {
     for (const kind of KINDS) {
       const next = readings[kind]
       const prev = l.readings[kind]
-      if (next && prev && qualifies(prev, next)) {
+      // A response that cost nothing (no price) moved the account without a dollar to learn from.
+      if (next && prev && cost > 0 && qualifies(prev, next)) {
         calibration = { ...calibration, [kind]: learn(calibration[kind], next.percent - prev.percent, cost) }
       }
     }

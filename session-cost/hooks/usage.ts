@@ -6,8 +6,8 @@ const MINUTE = 60_000
 const HOUR = 60 * MINUTE
 const DAY = 24 * HOUR
 
-/** How long a minute bucket is kept. */
-const KEEP_MS = 8 * DAY
+/** How long a minute bucket, or a stored session record, is kept. */
+export const KEEP_MS = 8 * DAY
 /** Two responses count as a pair for calibration when at most this far apart. */
 const PAIR_MS = 30_000
 /** Pairs needed, and the account points they must add up to, before a factor is trusted. */
